@@ -13,3 +13,9 @@ Use Pyinstaller to compile the binary with the following command:
 
 pyinstaller --onefile --windowed --name Muxy Muxy10.py
 
+Alternatively Better build for PyQt6 (recommended):
+
+pyinstaller --onefile --windowed --name Muxy \
+  --collect-all PyQt6 \
+  --hidden-import PIL \
+  Muxy10.py
