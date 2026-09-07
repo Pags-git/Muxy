@@ -3,7 +3,7 @@ To Install you require the following:
 Create your folder and save the Muxy10.py into it
 cd into your created folder and do the following:
 
-python -m venv venv
+python3 -m venv venv
 source venv/bin/activate
 pip install pyinstaller PyQt6 Pillow
 
