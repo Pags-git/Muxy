@@ -1,0 +1,10 @@
+The bundled FFmpeg and ffprobe executables come from BtbN FFmpeg-Builds.
+
+Release asset:
+https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-linux64-gpl-9.0.tar.xz
+
+SHA-256:
+c6885809f8314f7fad62237559899763e3e8ab3821587c564bf602b0b356c227
+
+The build and its license terms are described in FFmpeg-LICENSE.txt. The
+corresponding upstream project is https://github.com/BtbN/FFmpeg-Builds.

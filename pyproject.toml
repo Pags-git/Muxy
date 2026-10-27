@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "muxy"
+version = "0.1.0"
+description = "A Qt Widgets video editor powered by FFmpeg."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["PySide6>=6.7,<7", "Pillow>=10"]
+
+[project.optional-dependencies]
+packaging = ["appimage>=4.1,<5"]
+
+[project.scripts]
+muxy = "video_editor.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.appimage]
+app = "Muxy"
+entry_point = "muxy"
+icon = "packaging/muxy.svg"
+desktop = "packaging/Muxy.desktop"
+extra_files = { "build/ffmpeg/bin/ffmpeg" = "usr/bin/ffmpeg", "build/ffmpeg/bin/ffprobe" = "usr/bin/ffprobe", "build/ffmpeg/LICENSE.txt" = "usr/share/licenses/muxy/FFmpeg-LICENSE.txt", "packaging/FFmpeg-BUILD.txt" = "usr/share/licenses/muxy/FFmpeg-BUILD.txt" }
+
+[tool.appimage.hooks]
+pre_package = "packaging/pre_package.sh"

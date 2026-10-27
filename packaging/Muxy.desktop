@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Muxy
+Comment=A Qt Widgets video editor powered by FFmpeg.
+Exec=AppRun
+Icon=Muxy
+Categories=AudioVideo;Video;
+Terminal=false
