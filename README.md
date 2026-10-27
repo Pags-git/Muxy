@@ -1,27 +1,63 @@
-# Muxy (Video-1 working copy)
+# Muxy
 
-This is a separate working copy of Muxy. Its source is in `src/video_editor`; it shares the existing Python environment from `/home/mikepaglia/Software/Development/video/.venv` without changing the original `Video` project.
+Muxy is a desktop video editor and converter for Linux. It uses FFmpeg for video processing and PySide6 for its graphical interface.
 
-## Run with the existing environment
+## Requirements
+
+- Python 3.12 or later
+- FFmpeg and FFprobe available on your `PATH`
+- Git
+
+Check that both FFmpeg tools are available before setup:
 
 ```bash
+ffmpeg -version
+ffprobe -version
+```
+
+Install FFmpeg with your Linux distribution's package manager if either command is missing. Muxy uses the system FFmpeg build, so available encoders depend on how that build was packaged.
+
+## Download and run
+
+Clone the public Muxy desktop branch and enter the project directory:
+
+```bash
+git clone --branch muxy-desktop-10.5.0.5 https://github.com/Pags-git/Muxy.git muxy
+cd muxy
+```
+
+Create a virtual environment, install Muxy and its Python dependencies, then launch it:
+
+```bash
+python3.12 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install .
 ./run-muxy.sh
 ```
 
-The launcher loads code from this `Video-1` folder and dependencies from the existing `Video/.venv` environment. Edit files in `Video-1/src/video_editor/` to continue development here.
+The launcher uses the `.venv` inside the cloned folder. To use another Python environment, set `MUXY_PYTHON` when launching:
 
-The first **Summary** tab displays the loaded file's container and file details, video codec and frame information, plus its audio and subtitle tracks. In **Export**, **Web optimized (faststart)** moves the MP4/MOV index to the beginning of the output so playback can start before the full file downloads. FFmpeg performs a second pass for this operation.
-
-Selecting video passthrough automatically selects audio passthrough too, so changing containers defaults to remuxing instead of encoding. Audio can still be changed to AAC separately on the Audio tab.
-
-To create an independent environment instead, follow the setup instructions in `pyproject.toml` with Python 3.12 or newer and install the project into a new `.venv` in this folder.
+```bash
+MUXY_PYTHON=/path/to/python ./run-muxy.sh
+```
 
 ## Build a Linux AppImage
 
-The packaging script can use the shared environment by setting `MUXY_PYTHON`:
+Install the optional packaging dependency and run the build script:
 
 ```bash
-MUXY_PYTHON=/home/mikepaglia/Software/Development/video/.venv/bin/python ./packaging/build-appimage.sh
+.venv/bin/python -m pip install '.[packaging]'
+MUXY_PYTHON="$PWD/.venv/bin/python" ./packaging/build-appimage.sh
 ```
 
-The packaging script downloads FFmpeg and verifies its checksum before packaging.
+The build script downloads the FFmpeg bundle it needs and checks its SHA-256 checksum before packaging.
+
+## Main features
+
+- Inspect container, codecs, frame rate, colour information, and tracks in the Summary tab.
+- Adjust picture levels and preview changes, including a split before-and-after view.
+- Select video, audio, and subtitle streams and configure export options.
+- Save, load, and update presets spanning the editing tabs.
+- Remux compatible streams or re-encode with available FFmpeg encoders.
+- Export MP4/MOV with web-optimized faststart when supported.
+
