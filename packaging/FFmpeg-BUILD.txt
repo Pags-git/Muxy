@@ -4,7 +4,7 @@ Release asset:
 https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-linux64-gpl-9.0.tar.xz
 
 SHA-256:
-c6885809f8314f7fad62237559899763e3e8ab3821587c564bf602b0b356c227
+844421ab0f5a2ae227a0d7a5e43fd12bb18270b4fd5b26b3085f09260c34744f
 
 The build and its license terms are described in FFmpeg-LICENSE.txt. The
 corresponding upstream project is https://github.com/BtbN/FFmpeg-Builds.

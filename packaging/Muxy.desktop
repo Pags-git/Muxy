@@ -2,7 +2,8 @@
 Type=Application
 Name=Muxy
 Comment=A Qt Widgets video editor powered by FFmpeg.
-Exec=AppRun
+Exec=AppRun %f
 Icon=Muxy
 Categories=AudioVideo;Video;
 Terminal=false
+MimeType=video/mp4;video/x-matroska;video/webm;video/x-msvideo;video/mpeg;video/quicktime;video/x-flv;video/x-ms-wmv;video/3gpp;video/ogg;

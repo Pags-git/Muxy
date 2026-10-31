@@ -5,7 +5,7 @@ project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 build_dir="$project_root/build/ffmpeg"
 archive="$build_dir/ffmpeg-static.tar.xz"
 asset_url="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-linux64-gpl-9.0.tar.xz"
-asset_sha256="c6885809f8314f7fad62237559899763e3e8ab3821587c564bf602b0b356c227"
+asset_sha256="844421ab0f5a2ae227a0d7a5e43fd12bb18270b4fd5b26b3085f09260c34744f"
 
 if [[ ! -x "$build_dir/bin/ffmpeg" || ! -x "$build_dir/bin/ffprobe" || ! -f "$build_dir/LICENSE.txt" ]]; then
     mkdir -p "$build_dir"

@@ -1,5 +1,7 @@
 # Muxy
 
+Current desktop version: **10.6.0.8** (Python 3.12 / PySide6).
+
 Muxy is a desktop video editor and converter for Linux. It uses FFmpeg for video processing and PySide6 for its graphical interface.
 
 ## Requirements
@@ -19,10 +21,10 @@ Install FFmpeg with your Linux distribution's package manager if either command 
 
 ## Download and run
 
-Clone the public Muxy desktop branch and enter the project directory:
+Clone the current desktop source and enter the project directory:
 
 ```bash
-git clone --branch muxy-desktop-10.5.0.5 https://github.com/Pags-git/Muxy.git muxy
+git clone https://github.com/Pags-git/Muxy.git muxy
 cd muxy
 ```
 
@@ -56,8 +58,17 @@ The build script downloads the FFmpeg bundle it needs and checks its SHA-256 che
 
 - Inspect container, codecs, frame rate, colour information, and tracks in the Summary tab.
 - Adjust picture levels and preview changes, including a split before-and-after view.
+- Choose an export trim range by dragging the start and end handles below the preview timeline, then preview that section before encoding.
 - Select video, audio, and subtitle streams and configure export options.
 - Save, load, and update presets spanning the editing tabs.
 - Remux compatible streams or re-encode with available FFmpeg encoders.
 - Export MP4/MOV with web-optimized faststart when supported.
 
+
+## AppImage downloads
+
+Packaged Linux builds are distributed through [GitHub Releases](https://github.com/Pags-git/Muxy/releases). Download the AppImage and checksum from the matching release. Make the AppImage executable, then launch it. If FUSE is unavailable, use `--appimage-extract-and-run`.
+
+The current source is under `src/video_editor/`; the older single-file PyQt6 implementation remains available in Git history. Earlier desktop branches are retained for reference. Build output, virtual environments, backups, snapshots and local media are excluded from Git.
+
+The Linux AppImage bundles Python, PySide6 and FFmpeg/FFprobe. The host still provides baseline system libraries, display and graphics/audio services. Builds are for Linux x86_64; other platforms and Linux distributions require testing. FFmpeg provenance and license details are included by the packaging scripts.

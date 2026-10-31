@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "muxy"
-version = "0.1.0"
+version = "10.6.0.8"
 description = "A Qt Widgets video editor powered by FFmpeg."
 readme = "README.md"
 requires-python = ">=3.12"

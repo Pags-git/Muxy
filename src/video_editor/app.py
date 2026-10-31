@@ -16,6 +16,8 @@ from PIL import Image, ImageEnhance, ImageFilter
 from PySide6.QtCore import (
     QEvent,
     QObject,
+    QProcess,
+    QSize,
     QStandardPaths,
     Qt,
     QThread,
@@ -23,7 +25,7 @@ from PySide6.QtCore import (
     QUrl,
     Signal,
 )
-from PySide6.QtGui import QAction, QIcon, QImage, QKeySequence, QPixmap
+from PySide6.QtGui import QAction, QColor, QIcon, QImage, QKeySequence, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
 from PySide6.QtWidgets import (
     QApplication,
@@ -42,6 +44,8 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSpinBox,
+    QStyle,
     QSlider,
     QStackedWidget,
     QSplitter,
@@ -50,8 +54,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-# Increase the final component for each saved project snapshot.
-APP_VERSION = "10.5.0.5"
+# Current product version shown in About and application metadata.
+APP_VERSION = "10.6.0.8"
 
 
 def probe_media(path: str) -> dict:
@@ -116,8 +120,18 @@ class PreviewLabel(QLabel):
         super().__init__("Drop a video here, or choose File → Open Video")
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumSize(480, 270)
-        self.setStyleSheet("background: #111; color: #bbb; border: 1px solid #333")
+        self.setStyleSheet("border: 1px solid palette(mid)")
         self._frame: QPixmap | None = None
+
+    def set_theme(self, dark: bool) -> None:
+        background, foreground, border = (
+            ("#111315", "#c7c9cc", "#45474d")
+            if dark
+            else ("#e7e9ed", "#30343a", "#b8bdc5")
+        )
+        self.setStyleSheet(
+            f"background: {background}; color: {foreground}; border: 1px solid {border}"
+        )
 
     def set_frame(self, image: QImage) -> None:
         self._frame = QPixmap.fromImage(image)
@@ -141,6 +155,202 @@ class PreviewLabel(QLabel):
                     Qt.TransformationMode.SmoothTransformation,
                 )
             )
+
+
+class TrimRangeSlider(QWidget):
+    """Compact dual-handle timeline for selecting the exported video range."""
+
+    rangeChanged = Signal(int, int)
+    previewPositionChanged = Signal(int)
+    dragStarted = Signal()
+    dragFinished = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.duration_ms = 0
+        self.start_ms = 0
+        self.end_ms = 0
+        self._dragging: str | None = None
+        self._active_handle = "start"
+        self._handle_radius = 7
+        self.setMinimumHeight(24)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setToolTip(
+            "Drag the handles to choose the exported section. Frame-accurate cuts "
+            "require re-encoding; video copy may trim at nearby keyframes. "
+            "Trim points snap to one-second increments. Focus the timeline and "
+            "use the left and right arrow keys for precise one-second adjustments."
+        )
+
+    def sizeHint(self):  # noqa: N802 - Qt override
+        from PySide6.QtCore import QSize
+
+        return QSize(320, 26)
+
+    def set_duration(self, duration_ms: int, reset: bool = False) -> None:
+        duration_ms = max(0, int(duration_ms))
+        was_full_range = self.end_ms == self.duration_ms
+        self.duration_ms = duration_ms
+        if duration_ms <= 0:
+            self.start_ms = self.end_ms = 0
+        elif reset or was_full_range:
+            self.start_ms, self.end_ms = 0, duration_ms
+        else:
+            self.start_ms = min(self.start_ms, duration_ms - 1)
+            self.end_ms = min(max(self.end_ms, self.start_ms + 1), duration_ms)
+        self.update()
+        self.rangeChanged.emit(self.start_ms, self.end_ms)
+
+    def reset(self) -> None:
+        self.start_ms = 0
+        self.end_ms = self.duration_ms
+        self.update()
+        self.rangeChanged.emit(self.start_ms, self.end_ms)
+
+    def set_boundary(self, boundary: str, position_ms: int) -> None:
+        if self.duration_ms <= 0:
+            return
+        minimum_gap = min(1000, self.duration_ms)
+        value = min(self.duration_ms, max(0, round(position_ms / 1000) * 1000))
+        if boundary == "start":
+            self.start_ms = min(value, max(0, self.end_ms - minimum_gap))
+            position = self.start_ms
+        else:
+            self.end_ms = max(value, min(self.duration_ms, self.start_ms + minimum_gap))
+            position = self.end_ms
+        self._active_handle = boundary
+        self.update()
+        self.rangeChanged.emit(self.start_ms, self.end_ms)
+        self.previewPositionChanged.emit(position)
+
+    def _track_bounds(self) -> tuple[float, float]:
+        margin = self._handle_radius + 2
+        return float(margin), float(max(margin, self.width() - margin))
+
+    def _value_to_x(self, value: int) -> float:
+        left, right = self._track_bounds()
+        if self.duration_ms <= 0:
+            return left
+        return left + (right - left) * value / self.duration_ms
+
+    def _x_to_value(self, x: float) -> int:
+        left, right = self._track_bounds()
+        if self.duration_ms <= 0 or right <= left:
+            return 0
+        proportion = min(1.0, max(0.0, (x - left) / (right - left)))
+        return round(proportion * self.duration_ms)
+
+    def paintEvent(self, _event) -> None:  # noqa: N802 - Qt override
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        left, right = self._track_bounds()
+        center_y = self.height() / 2
+        track_height = 5
+        painter.setPen(Qt.PenStyle.NoPen)
+        palette = self.palette()
+        painter.setBrush(palette.color(QPalette.ColorRole.Mid))
+        painter.drawRoundedRect(left, center_y - track_height / 2, right - left, track_height, 2.5, 2.5)
+
+        start_x = self._value_to_x(self.start_ms)
+        end_x = self._value_to_x(self.end_ms)
+        painter.setBrush(palette.color(QPalette.ColorRole.Highlight))
+        painter.drawRoundedRect(start_x, center_y - track_height / 2, max(0.0, end_x - start_x), track_height, 2.5, 2.5)
+
+        painter.setPen(QPen(palette.color(QPalette.ColorRole.WindowText), 1.5))
+        painter.setBrush(palette.color(QPalette.ColorRole.Base))
+        for x in (start_x, end_x):
+            painter.drawEllipse(x - self._handle_radius, center_y - self._handle_radius,
+                                self._handle_radius * 2, self._handle_radius * 2)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if not self.isEnabled() or self.duration_ms <= 0 or event.button() != Qt.MouseButton.LeftButton:
+            return
+        x = event.position().x()
+        start_x, end_x = self._value_to_x(self.start_ms), self._value_to_x(self.end_ms)
+        if abs(x - start_x) <= abs(x - end_x):
+            self._dragging = "start"
+        else:
+            self._dragging = "end"
+        self._active_handle = self._dragging
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+        self.dragStarted.emit()
+        self._set_drag_value(x)
+        self.setCursor(Qt.CursorShape.SizeHorCursor)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if self._dragging:
+            self._set_drag_value(event.position().x())
+        elif self.isEnabled():
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if event.button() == Qt.MouseButton.LeftButton:
+            was_dragging = self._dragging is not None
+            self._dragging = None
+            if was_dragging:
+                self.dragFinished.emit()
+
+    def leaveEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if not self._dragging:
+            self.unsetCursor()
+        super().leaveEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if event.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right) and self.duration_ms > 0:
+            delta = 1000 if event.key() == Qt.Key.Key_Right else -1000
+            minimum_gap = min(1000, self.duration_ms)
+            self.dragStarted.emit()
+            if self._active_handle == "start":
+                self.start_ms = min(
+                    max(0, self.start_ms + delta),
+                    max(0, self.end_ms - minimum_gap),
+                )
+                position = self.start_ms
+            else:
+                self.end_ms = min(
+                    self.duration_ms,
+                    max(self.start_ms + minimum_gap, self.end_ms + delta),
+                )
+                position = self.end_ms
+            self.update()
+            self.rangeChanged.emit(self.start_ms, self.end_ms)
+            self.previewPositionChanged.emit(position)
+            self.dragFinished.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _set_drag_value(self, x: float) -> None:
+        value = round(self._x_to_value(x) / 1000) * 1000
+        value = min(self.duration_ms, max(0, value))
+        minimum_gap = min(1000, self.duration_ms)
+        if self._dragging == "start":
+            value = min(value, max(0, self.end_ms - minimum_gap))
+            self.start_ms = (value // 1000) * 1000
+        elif self._dragging == "end":
+            self.end_ms = max(value, min(self.duration_ms, self.start_ms + minimum_gap))
+        else:
+            return
+        self.update()
+        self.rangeChanged.emit(self.start_ms, self.end_ms)
+        self.previewPositionChanged.emit(
+            self.start_ms if self._dragging == "start" else self.end_ms
+        )
+
+
+class TrimTimeSpinBox(QSpinBox):
+    """Integer-second time editor displayed as MM:SS."""
+
+    def textFromValue(self, value: int) -> str:  # noqa: N802 - Qt override
+        return f"{value // 60:02d}:{value % 60:02d}"
+
+    def valueFromText(self, text: str) -> int:  # noqa: N802 - Qt override
+        try:
+            minutes, seconds = text.strip().split(":", 1)
+            return max(0, int(minutes) * 60 + int(seconds))
+        except (ValueError, TypeError):
+            return 0
 
 
 class PreviewWindow(QMainWindow):
@@ -278,9 +488,10 @@ class VideoEditorWindow(QMainWindow):
         available = screen.availableGeometry() if screen else None
         available_width = available.width() if available else 1600
         available_height = available.height() if available else 1000
-        startup_height = min(800, available_height)
-        self.resize(min(1600, available_width), startup_height)
-        self.setMinimumSize(min(1280, available_width), min(650, startup_height))
+        startup_width = min(1280, available_width)
+        startup_height = min(650, available_height)
+        self.resize(startup_width, startup_height)
+        self.setMinimumSize(startup_width, startup_height)
         self.setAcceptDrops(True)
         self.current_path: str | None = None
         self.media_info: dict = {}
@@ -308,6 +519,13 @@ class VideoEditorWindow(QMainWindow):
         self.player.durationChanged.connect(self.set_duration)
         self.player.positionChanged.connect(self.set_position)
         self.player.playbackStateChanged.connect(self.update_play_button)
+        self._trim_frame_process: QProcess | None = None
+        self._trim_frame_source_generation = 0
+        self._trim_preview_pending_position = 0
+        self.trim_frame_timer = QTimer(self)
+        self.trim_frame_timer.setSingleShot(True)
+        self.trim_frame_timer.setInterval(35)
+        self.trim_frame_timer.timeout.connect(self.decode_trim_preview_frame)
 
         self.preview = PreviewLabel()
         self.preview_window = PreviewWindow()
@@ -319,23 +537,106 @@ class VideoEditorWindow(QMainWindow):
         self.position_slider.setRange(0, 0)
         self.position_slider.sliderMoved.connect(self.player.setPosition)
         self.time_label = QLabel("00:00 / 00:00")
+        self.trim_range_slider = TrimRangeSlider()
+        self.trim_range_slider.setEnabled(False)
+        self.trim_range_slider.rangeChanged.connect(self.update_trim_label)
+        self.trim_range_slider.previewPositionChanged.connect(self.preview_trim_position)
+        self.trim_range_slider.dragStarted.connect(self.begin_trim_handle_drag)
+        self.trim_range_slider.dragFinished.connect(self.finish_trim_handle_drag)
+        self._trim_handle_dragging = False
+        self.trim_start_spin = TrimTimeSpinBox()
+        self.trim_end_spin = TrimTimeSpinBox()
+        for spin in (self.trim_start_spin, self.trim_end_spin):
+            spin.setRange(0, 0)
+            spin.setSingleStep(1)
+            spin.setAccelerated(True)
+            spin.setKeyboardTracking(False)
+            spin.setFixedWidth(82)
+            spin.setEnabled(False)
+        self.trim_start_spin.setToolTip("Trim start time; use the arrows for one-second steps.")
+        self.trim_end_spin.setToolTip("Trim end time; use the arrows for one-second steps.")
+        self.trim_start_spin.valueChanged.connect(
+            lambda seconds: self.trim_range_slider.set_boundary("start", seconds * 1000)
+        )
+        self.trim_end_spin.valueChanged.connect(
+            lambda seconds: self.trim_range_slider.set_boundary("end", seconds * 1000)
+        )
+        self.trim_range_label = QLabel("Selected: 00:00")
+        self.trim_preview_active = False
+        self.trim_preview_button = QPushButton("Preview trim")
+        self.trim_preview_button.setEnabled(False)
+        self.trim_preview_button.clicked.connect(self.preview_trim)
+        self.reset_trim_button = QPushButton("Reset trim")
+        self.reset_trim_button.setEnabled(False)
+        self.reset_trim_button.clicked.connect(self.trim_range_slider.reset)
         self.summary_file_label: QLabel | None = None
         self.summary_video_label: QLabel | None = None
         self.summary_audio_label: QLabel | None = None
         self.summary_subtitle_label: QLabel | None = None
 
-        self.play_button = QPushButton("Play")
+        self.play_button = QPushButton()
+        self.play_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
+        )
+        self.play_button.setIconSize(QSize(20, 20))
+        self.play_button.setFixedSize(44, 36)
+        self.play_button.setToolTip("Play video")
+        self.play_button.setAccessibleName("Play video")
         self.play_button.clicked.connect(self.toggle_playback)
-        self.seek_back_button = QPushButton("⏪ 5s")
+        self.seek_back_button = QPushButton()
+        self.seek_back_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaSeekBackward)
+        )
+        self.seek_back_button.setIconSize(QSize(20, 20))
+        self.seek_back_button.setFixedSize(44, 36)
+        self.seek_back_button.setToolTip("Rewind 5 seconds")
+        self.seek_back_button.setAccessibleName("Rewind 5 seconds")
         self.seek_back_button.clicked.connect(lambda: self.seek_by(-5000))
-        self.seek_forward_button = QPushButton("5s ⏩")
+        self.seek_forward_button = QPushButton()
+        self.seek_forward_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaSeekForward)
+        )
+        self.seek_forward_button.setIconSize(QSize(20, 20))
+        self.seek_forward_button.setFixedSize(44, 36)
+        self.seek_forward_button.setToolTip("Forward 5 seconds")
+        self.seek_forward_button.setAccessibleName("Forward 5 seconds")
         self.seek_forward_button.clicked.connect(lambda: self.seek_by(5000))
-        transport = QHBoxLayout()
-        transport.addWidget(self.seek_back_button)
-        transport.addWidget(self.play_button)
-        transport.addWidget(self.seek_forward_button)
-        transport.addWidget(self.time_label)
-        transport.addStretch(1)
+        transport_widget = QWidget()
+        transport = QGridLayout(transport_widget)
+        transport.setContentsMargins(0, 0, 0, 0)
+        transport.setHorizontalSpacing(6)
+        transport.setVerticalSpacing(4)
+        transport.setColumnStretch(0, 1)
+        transport.setColumnStretch(5, 1)
+        transport.addWidget(self.seek_back_button, 0, 1, alignment=Qt.AlignmentFlag.AlignCenter)
+        transport.addWidget(self.play_button, 0, 2, alignment=Qt.AlignmentFlag.AlignCenter)
+        transport.addWidget(self.seek_forward_button, 0, 3, alignment=Qt.AlignmentFlag.AlignCenter)
+        transport.addWidget(self.time_label, 0, 4)
+        self.preview_volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.preview_volume_slider.setRange(0, 100)
+        self.preview_volume_slider.setValue(100)
+        self.preview_volume_slider.setMaximumWidth(180)
+        self.preview_volume_slider.setToolTip("Preview playback volume")
+        self.preview_volume_slider.valueChanged.connect(self.set_preview_volume)
+        preview_volume_icon = QLabel()
+        preview_volume_icon.setPixmap(
+            self.style()
+            .standardIcon(QStyle.StandardPixmap.SP_MediaVolume)
+            .pixmap(QSize(18, 18))
+        )
+        preview_volume_icon.setToolTip("Preview playback volume")
+        preview_volume_icon.setAccessibleName("Preview playback volume")
+        preview_volume_row_widget = QWidget()
+        preview_volume_row = QHBoxLayout(preview_volume_row_widget)
+        preview_volume_row.setContentsMargins(0, 0, 0, 0)
+        preview_volume_row.setSpacing(2)
+        preview_volume_row.addSpacing(
+            (self.seek_back_button.width() - preview_volume_icon.sizeHint().width()) // 2
+        )
+        preview_volume_row.addWidget(preview_volume_icon)
+        preview_volume_row.addWidget(self.preview_volume_slider)
+        preview_volume_row.addStretch(1)
+        transport.addWidget(preview_volume_row_widget, 1, 1, 1, 4)
 
         preview_panel = QWidget()
         preview_layout = QVBoxLayout(preview_panel)
@@ -371,12 +672,23 @@ class VideoEditorWindow(QMainWindow):
         self.view_mode_button.clicked.connect(self.toggle_preview_mode)
         preview_buttons = QHBoxLayout()
         preview_buttons.addWidget(self.view_mode_button)
-        self.pop_out_button = QPushButton("Pop out preview")
+        self.pop_out_button = QPushButton("Float")
         self.pop_out_button.clicked.connect(self.toggle_preview_window)
         preview_buttons.addWidget(self.pop_out_button)
         preview_layout.addLayout(preview_buttons)
         preview_layout.addWidget(self.position_slider)
-        preview_layout.addLayout(transport)
+        trim_row = QHBoxLayout()
+        trim_row.addWidget(QLabel("Start"))
+        trim_row.addWidget(self.trim_start_spin)
+        trim_row.addWidget(QLabel("End"))
+        trim_row.addWidget(self.trim_end_spin)
+        trim_row.addWidget(self.trim_range_label)
+        trim_row.addStretch(1)
+        trim_row.addWidget(self.trim_preview_button)
+        trim_row.addWidget(self.reset_trim_button)
+        preview_layout.addLayout(trim_row)
+        preview_layout.addWidget(self.trim_range_slider)
+        preview_layout.addWidget(transport_widget)
         preview_layout.addWidget(self.make_media_details())
         self.preview_window.closed.connect(self.on_preview_window_closed)
 
@@ -417,26 +729,134 @@ class VideoEditorWindow(QMainWindow):
         self.menuBar().addAction(about_action)
 
         self.statusBar().showMessage("Drop a video file anywhere in the window to open it")
-        self.setStyleSheet(
-            "QMainWindow { background: #202124; } QWidget { color: #eee; }"
-            "QGroupBox { border: 1px solid #555; border-radius: 5px; margin-top: 10px;"
+        if self.app:
+            self.app.styleHints().colorSchemeChanged.connect(self.apply_theme)
+        self.apply_theme()
+
+    def system_theme_is_dark(self) -> bool:
+        if shutil.which("gsettings"):
+            try:
+                scheme = subprocess.run(
+                    ["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"],
+                    capture_output=True,
+                    text=True,
+                    timeout=0.5,
+                    check=False,
+                ).stdout.strip().strip("'").lower()
+                if scheme == "prefer-dark":
+                    return True
+                if scheme == "prefer-light":
+                    return False
+
+                theme = subprocess.run(
+                    ["gsettings", "get", "org.gnome.desktop.interface", "gtk-theme"],
+                    capture_output=True,
+                    text=True,
+                    timeout=0.5,
+                    check=False,
+                ).stdout.strip().strip("'").lower()
+                if "dark" in theme:
+                    return True
+                if "light" in theme:
+                    return False
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+        scheme = self.app.styleHints().colorScheme
+        if callable(scheme):
+            scheme = scheme()
+        if scheme == Qt.ColorScheme.Dark:
+            return True
+        if scheme == Qt.ColorScheme.Light:
+            return False
+        return self.app.palette().color(QPalette.ColorRole.Window).lightness() < 128
+
+    def apply_theme(self, *_args) -> None:
+        if not self.app:
+            return
+        dark = self.system_theme_is_dark()
+
+        if dark:
+            window, foreground = "#202124", "#eeeeee"
+            field, menu, border = "#303238", "#25272d", "#666970"
+            selected, selected_text, highlight = "#8d5a22", "#ffffff", "#bd792b"
+            slider_highlight = "#78b7ee"
+            track, handle_edge, handle = "#45474d", "#17181b", "#f0f0f0"
+            credit = "#a5a5a5"
+        else:
+            window, foreground = "#f4f5f7", "#202124"
+            field, menu, border = "#ffffff", "#ffffff", "#aeb4bd"
+            selected, selected_text, highlight = "#d6e5fa", "#17365d", "#bd792b"
+            slider_highlight = "#4c91cf"
+            track, handle_edge, handle = "#c4c9d1", "#60656d", "#ffffff"
+            credit = "#62666d"
+
+        app_palette = QPalette(self.app.palette())
+        palette_colors = {
+            QPalette.ColorRole.Window: window,
+            QPalette.ColorRole.WindowText: foreground,
+            QPalette.ColorRole.Base: field,
+            QPalette.ColorRole.AlternateBase: menu,
+            QPalette.ColorRole.ToolTipBase: field,
+            QPalette.ColorRole.ToolTipText: foreground,
+            QPalette.ColorRole.Text: foreground,
+            QPalette.ColorRole.Button: field,
+            QPalette.ColorRole.ButtonText: foreground,
+            QPalette.ColorRole.BrightText: selected_text,
+            QPalette.ColorRole.Highlight: slider_highlight,
+            QPalette.ColorRole.HighlightedText: selected_text,
+            QPalette.ColorRole.Link: highlight,
+            QPalette.ColorRole.Mid: track,
+            QPalette.ColorRole.Dark: border,
+        }
+        for role, color in palette_colors.items():
+            app_palette.setColor(role, QColor(color))
+        self.app.setPalette(app_palette)
+
+        stylesheet = (
+            f"QMainWindow {{ background: {window}; }} QWidget {{ color: {foreground}; }}"
+            f"QGroupBox {{ border: 1px solid {border}; border-radius: 5px; margin-top: 10px;"
             " padding: 8px; font-weight: 600; }"
             "QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }"
             "QPushButton { padding: 6px; }"
-            "QComboBox { color: #f5f3ef; background-color: #303238;"
-            " border: 1px solid #666970; border-radius: 4px; padding: 6px; }"
-            "QComboBox:focus { border: 1px solid #e1a552; }"
-            "QComboBox#containerCombo:focus { border: 1px solid #666970; }"
-            "QComboBox#containerCombo QLineEdit { color: #f5f3ef; background-color: #303238;"
-            " selection-color: #ffffff; selection-background-color: #55575f; border: none; }"
-            "QComboBox QAbstractItemView { color: #f5f3ef; background-color: #25272d;"
-            " selection-color: #ffffff; selection-background-color: #8d5a22;"
-            " border: 1px solid #666970; outline: 0; }"
-            "QComboBox QAbstractItemView::item:selected { color: #ffffff; background-color: #8d5a22; }"
-            "QProgressBar { color: #ffffff; background-color: #303238;"
-            " border: 1px solid #666970; border-radius: 4px; text-align: center; }"
-            "QProgressBar::chunk { background-color: #bd792b; border-radius: 3px; }"
+            f"QComboBox {{ color: {foreground}; background-color: {field};"
+            f" border: 1px solid {border}; border-radius: 4px; padding: 6px; }}"
+            f"QComboBox:focus {{ border: 1px solid {highlight}; }}"
+            f"QComboBox#containerCombo:focus {{ border: 1px solid {border}; }}"
+            f"QComboBox#containerCombo QLineEdit {{ color: {foreground}; background-color: {field};"
+            f" selection-color: {selected_text}; selection-background-color: {selected}; border: none; }}"
+            f"QComboBox QAbstractItemView {{ color: {foreground}; background-color: {menu};"
+            f" selection-color: {selected_text}; selection-background-color: {selected};"
+            f" border: 1px solid {border}; outline: 0; }}"
+            f"QComboBox QAbstractItemView::item:selected {{ color: {selected_text}; background-color: {selected}; }}"
+            f"QProgressBar {{ color: {foreground}; background-color: {field};"
+            f" border: 1px solid {border}; border-radius: 4px; text-align: center; }}"
+            f"QProgressBar::chunk {{ background-color: {highlight}; border-radius: 3px; }}"
         )
+        for window_widget in (self, self.preview_window, self.picture_float_window):
+            window_widget.setStyleSheet(stylesheet)
+
+        preview_labels = [
+            self.preview,
+            self.before_preview,
+            self.comparison_after_preview,
+            self.preview_window.preview,
+            self.preview_window.before_preview,
+            self.preview_window.comparison_after_preview,
+        ]
+        for label in preview_labels:
+            label.set_theme(dark)
+
+        slider_palette = QPalette(self.app.palette())
+        slider_palette.setColor(QPalette.ColorRole.Mid, QColor(track))
+        slider_palette.setColor(QPalette.ColorRole.Highlight, QColor(slider_highlight))
+        slider_palette.setColor(QPalette.ColorRole.WindowText, QColor(handle_edge))
+        slider_palette.setColor(QPalette.ColorRole.Base, QColor(handle))
+        self.trim_range_slider.setPalette(slider_palette)
+        self.trim_range_slider.update()
+
+        if hasattr(self, "app_credit"):
+            self.app_credit.setStyleSheet(f"color: {credit}; font-size: 10pt;")
 
     def show_about(self) -> None:
         QMessageBox.about(
@@ -707,7 +1127,13 @@ class VideoEditorWindow(QMainWindow):
             self.audio_codec_combo.setCurrentIndex(audio_codec_index)
         else:
             warnings.append("The saved audio encoder is unavailable; the current encoder was kept.")
-        channels_index = self.audio_channels_combo.findData(audio.get("channels"))
+        saved_channels = audio.get("channels")
+        if saved_channels == 0:
+            saved_channels = 2
+            warnings.append(
+                "The saved ‘Match source track layout’ option is no longer available; Stereo was selected."
+            )
+        channels_index = self.audio_channels_combo.findData(saved_channels)
         if channels_index >= 0:
             self.audio_channels_combo.setCurrentIndex(channels_index)
         bitrate_index = self.audio_bitrate_combo.findData(audio.get("bitrate"))
@@ -822,6 +1248,9 @@ class VideoEditorWindow(QMainWindow):
         for group in (summary_file_group, summary_video_group, summary_audio_group, summary_subtitle_group):
             summary_layout.addWidget(group)
         summary_layout.addStretch(1)
+        self.app_credit = QLabel("An App by Pags")
+        self.app_credit.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        summary_layout.addWidget(self.app_credit)
 
         picture_tab = QWidget()
         picture_layout = QVBoxLayout(picture_tab)
@@ -859,7 +1288,7 @@ class VideoEditorWindow(QMainWindow):
         self.picture_view_mode_button.clicked.connect(self.toggle_preview_mode)
         denoise_note = QLabel("It is recommended to pause the video when using Denoise.")
         denoise_note.setWordWrap(True)
-        denoise_note.setStyleSheet("font-style: italic; color: #bbb;")
+        denoise_note.setStyleSheet("font-style: italic;")
         grid.addWidget(denoise_note, 5, 0, 1, 3)
         picture_actions = QHBoxLayout()
         picture_actions.addWidget(self.picture_view_mode_button)
@@ -867,22 +1296,79 @@ class VideoEditorWindow(QMainWindow):
         picture_actions.addWidget(reset_button)
         picture_actions.addWidget(self.float_picture_button)
         grid.addLayout(picture_actions, 6, 0, 1, 3)
-        picture_transport = QHBoxLayout()
-        self.picture_seek_back_button = QPushButton("⏪ 5s")
+        picture_transport_widget = QWidget()
+        picture_transport = QGridLayout(picture_transport_widget)
+        picture_transport.setContentsMargins(0, 0, 0, 0)
+        picture_transport.setHorizontalSpacing(6)
+        picture_transport.setVerticalSpacing(4)
+        picture_transport.setColumnStretch(0, 1)
+        picture_transport.setColumnStretch(4, 1)
+        self.picture_seek_back_button = QPushButton()
+        self.picture_seek_back_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaSeekBackward)
+        )
+        self.picture_seek_back_button.setIconSize(QSize(20, 20))
+        self.picture_seek_back_button.setFixedSize(44, 36)
+        self.picture_seek_back_button.setToolTip("Rewind 5 seconds")
+        self.picture_seek_back_button.setAccessibleName("Rewind 5 seconds")
         self.picture_seek_back_button.clicked.connect(lambda: self.seek_by(-5000))
-        self.picture_play_button = QPushButton("Play")
+        self.picture_play_button = QPushButton()
+        self.picture_play_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
+        )
+        self.picture_play_button.setIconSize(QSize(20, 20))
+        self.picture_play_button.setFixedSize(44, 36)
+        self.picture_play_button.setToolTip("Play video")
+        self.picture_play_button.setAccessibleName("Play video")
         self.picture_play_button.clicked.connect(self.toggle_playback)
-        self.picture_seek_forward_button = QPushButton("5s ⏩")
+        self.picture_seek_forward_button = QPushButton()
+        self.picture_seek_forward_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaSeekForward)
+        )
+        self.picture_seek_forward_button.setIconSize(QSize(20, 20))
+        self.picture_seek_forward_button.setFixedSize(44, 36)
+        self.picture_seek_forward_button.setToolTip("Forward 5 seconds")
+        self.picture_seek_forward_button.setAccessibleName("Forward 5 seconds")
         self.picture_seek_forward_button.clicked.connect(lambda: self.seek_by(5000))
-        picture_transport.addWidget(self.picture_seek_back_button)
-        picture_transport.addWidget(self.picture_play_button)
-        picture_transport.addWidget(self.picture_seek_forward_button)
-        grid.addLayout(picture_transport, 7, 0, 1, 3)
+        picture_transport.addWidget(
+            self.picture_seek_back_button, 0, 1, alignment=Qt.AlignmentFlag.AlignCenter
+        )
+        picture_transport.addWidget(
+            self.picture_play_button, 0, 2, alignment=Qt.AlignmentFlag.AlignCenter
+        )
+        picture_transport.addWidget(
+            self.picture_seek_forward_button, 0, 3, alignment=Qt.AlignmentFlag.AlignCenter
+        )
+        self.picture_volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.picture_volume_slider.setRange(0, 100)
+        self.picture_volume_slider.setValue(100)
+        self.picture_volume_slider.setToolTip("Preview playback volume")
+        self.picture_volume_slider.valueChanged.connect(self.set_preview_volume)
+        picture_volume_icon = QLabel()
+        picture_volume_icon.setPixmap(
+            self.style()
+            .standardIcon(QStyle.StandardPixmap.SP_MediaVolume)
+            .pixmap(QSize(18, 18))
+        )
+        picture_volume_icon.setToolTip("Preview playback volume")
+        picture_volume_icon.setAccessibleName("Preview playback volume")
+        picture_volume_row_widget = QWidget()
+        picture_volume_row = QHBoxLayout(picture_volume_row_widget)
+        picture_volume_row.setContentsMargins(0, 0, 0, 0)
+        picture_volume_row.setSpacing(2)
+        picture_volume_row.addSpacing(
+            (self.picture_seek_back_button.width() - picture_volume_icon.sizeHint().width()) // 2
+        )
+        picture_volume_row.addWidget(picture_volume_icon)
+        picture_volume_row.addWidget(self.picture_volume_slider)
+        picture_volume_row.addStretch(1)
+        picture_transport.addWidget(picture_volume_row_widget, 1, 1, 1, 3)
+        grid.addWidget(picture_transport_widget, 7, 0, 2, 3)
         self.picture_position_slider = QSlider(Qt.Orientation.Horizontal)
         self.picture_position_slider.setRange(0, 0)
         self.picture_position_slider.setToolTip("Scrub through the video")
         self.picture_position_slider.sliderMoved.connect(self.player.setPosition)
-        grid.addWidget(self.picture_position_slider, 8, 0, 1, 3)
+        grid.addWidget(self.picture_position_slider, 9, 0, 1, 3)
         grid.setColumnMinimumWidth(2, 38)
         grid.setColumnStretch(1, 1)
         picture_layout.addWidget(self.adjustments_group)
@@ -894,7 +1380,7 @@ class VideoEditorWindow(QMainWindow):
         self.picture_float_window.setWindowFlag(
             Qt.WindowType.WindowStaysOnTopHint, True
         )
-        self.picture_float_window.resize(520, 350)
+        self.picture_float_window.setFixedSize(520, 350)
         self.picture_float_layout = QVBoxLayout(self.picture_float_window)
         self.picture_float_window.finished.connect(self.restore_picture_controls)
 
@@ -910,7 +1396,9 @@ class VideoEditorWindow(QMainWindow):
         self.video_codec_combo = QComboBox()
         self.video_codec_combo.setToolTip(
             "Passthrough copies the video stream without re-encoding. Selecting it also switches "
-            "audio to passthrough; you can choose an audio encoder separately on the Audio tab."
+            "audio to passthrough; you can choose an audio encoder separately on the Audio tab. "
+            "H.264 NVENC uses 8-bit output, so 10-bit input is converted and its full bit depth "
+            "is not retained."
         )
         self.video_codec_combo.currentIndexChanged.connect(
             self.update_video_controls_enabled
@@ -980,11 +1468,11 @@ class VideoEditorWindow(QMainWindow):
         audio_controls_layout = QGridLayout(audio_controls)
         self.audio_codec_combo = QComboBox()
         self.audio_channels_combo = QComboBox()
-        self.audio_channels_combo.addItem("Match source track layout", 0)
         self.audio_channels_combo.addItem("Mono (1.0)", 1)
         self.audio_channels_combo.addItem("Stereo (2.0)", 2)
         self.audio_channels_combo.addItem("5.1 surround", 6)
         self.audio_channels_combo.addItem("7.1 surround", 8)
+        self.audio_channels_combo.setCurrentIndex(self.audio_channels_combo.findData(2))
         self.audio_bitrate_combo = QComboBox()
         for bitrate in (64, 96, 128, 160, 192, 224, 256, 320, 384):
             self.audio_bitrate_combo.addItem(f"{bitrate} kb/s", bitrate)
@@ -1030,21 +1518,68 @@ class VideoEditorWindow(QMainWindow):
         self.export_progress.setRange(0, 100)
         self.export_progress.setValue(0)
         self.export_estimate = QLabel("Estimated time remaining: —")
+        video_review_group = QGroupBox("Video")
+        video_review_layout = QVBoxLayout(video_review_group)
+        video_review_layout.setContentsMargins(16, 6, 6, 6)
+        video_review_layout.setSpacing(2)
+        self.video_review_rows: dict[str, QLabel] = {}
+        for setting in ("Container", "Video", "RF", "Frame rate", "Color"):
+            row = QLabel()
+            self.video_review_rows[setting] = row
+            video_review_layout.addWidget(row)
+        audio_review_group = QGroupBox("Audio")
+        audio_review_layout = QVBoxLayout(audio_review_group)
+        audio_review_layout.setContentsMargins(16, 6, 6, 6)
+        audio_review_layout.setSpacing(2)
+        self.audio_review_rows: dict[str, QLabel] = {}
+        for setting in ("Encoder", "Output layout", "Bit rate", "Tracks"):
+            row = QLabel()
+            self.audio_review_rows[setting] = row
+            audio_review_layout.addWidget(row)
+        subtitle_review_group = QGroupBox("Subtitles")
+        subtitle_review_layout = QVBoxLayout(subtitle_review_group)
+        subtitle_review_layout.setContentsMargins(16, 6, 6, 6)
+        subtitle_review_layout.setSpacing(2)
+        self.subtitle_review_tracks_heading = QLabel("Tracks:")
+        subtitle_review_layout.addWidget(self.subtitle_review_tracks_heading)
+        self.subtitle_review_tracks_scroll = QScrollArea()
+        self.subtitle_review_tracks_scroll.setWidgetResizable(True)
+        self.subtitle_review_tracks_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.subtitle_review_tracks_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.subtitle_review_tracks_scroll.setMinimumHeight(0)
+        self.subtitle_review_tracks_scroll.setMaximumHeight(140)
+        self.subtitle_review_tracks_widget = QWidget()
+        self.subtitle_review_tracks_layout = QVBoxLayout(self.subtitle_review_tracks_widget)
+        self.subtitle_review_tracks_layout.setContentsMargins(10, 0, 0, 0)
+        self.subtitle_review_tracks_layout.setSpacing(2)
+        self.subtitle_review_tracks_scroll.setWidget(self.subtitle_review_tracks_widget)
+        subtitle_review_layout.addWidget(self.subtitle_review_tracks_scroll)
+        self.format_combo.currentTextChanged.connect(self.update_export_video_summary)
+        self.video_codec_combo.currentIndexChanged.connect(self.update_export_video_summary)
+        self.rf_slider.valueChanged.connect(self.update_export_video_summary)
+        self.frame_rate_combo.currentIndexChanged.connect(self.update_export_video_summary)
+        self.color_range_combo.currentIndexChanged.connect(self.update_export_video_summary)
+        self.audio_codec_combo.currentIndexChanged.connect(self.update_export_audio_summary)
+        self.audio_channels_combo.currentIndexChanged.connect(self.update_export_audio_summary)
+        self.audio_bitrate_combo.currentIndexChanged.connect(self.update_export_audio_summary)
         self.web_optimize_check = QCheckBox("Web optimised (faststart)")
         self.web_optimize_check.setToolTip(
             "For MP4 and MOV, move the movie index to the beginning of the file "
             "so playback can start before the whole file downloads. FFmpeg performs a second pass."
         )
-        self.web_optimize_description = QLabel(
-            "Moves the MP4/MOV index to the start for faster playback over the web."
-        )
-        self.web_optimize_description.setWordWrap(True)
         self.format_combo.currentTextChanged.connect(self.update_web_optimize_enabled)
         self.update_web_optimize_enabled()
+        self.update_export_video_summary()
+        self.update_export_audio_summary()
+        self.update_export_subtitle_summary()
         output_row = QHBoxLayout()
         output_row.addWidget(self.export_button)
+        export_layout.addWidget(video_review_group)
+        export_layout.addWidget(audio_review_group)
+        export_layout.addWidget(subtitle_review_group)
         export_layout.addWidget(self.web_optimize_check)
-        export_layout.addWidget(self.web_optimize_description)
         export_layout.addSpacing(5 * self.web_optimize_check.fontMetrics().lineSpacing())
         export_layout.addLayout(output_row)
         export_layout.addWidget(self.export_progress)
@@ -1053,14 +1588,6 @@ class VideoEditorWindow(QMainWindow):
 
         presets_tab = QWidget()
         presets_layout = QVBoxLayout(presets_tab)
-        presets_group = QGroupBox("Settings presets")
-        presets_group_layout = QVBoxLayout(presets_group)
-        presets_description = QLabel(
-            "Save or load a complete setup for the Picture, Video, Audio, Subtitles, "
-            "and Export tabs. Presets apply to the video currently loaded."
-        )
-        presets_description.setWordWrap(True)
-        presets_group_layout.addWidget(presets_description)
         preset_actions = QGridLayout()
         save_preset_button = QPushButton("Save current settings")
         save_preset_button.clicked.connect(self.save_current_preset)
@@ -1074,8 +1601,8 @@ class VideoEditorWindow(QMainWindow):
             (save_preset_button, update_preset_button, load_preset_button, manage_presets_button)
         ):
             preset_actions.addWidget(button, row // 2, row % 2)
-        presets_group_layout.addLayout(preset_actions)
-        presets_layout.addWidget(presets_group)
+        presets_layout.addSpacing(2 * save_preset_button.fontMetrics().lineSpacing())
+        presets_layout.addLayout(preset_actions)
         presets_layout.addStretch(1)
 
         self.export_tabs.addTab(summary_tab, "Summary")
@@ -1197,10 +1724,27 @@ class VideoEditorWindow(QMainWindow):
             "flv": {"aac", "mp3"},
             "ogv": {"vorbis", "opus"},
         }
+        mp4_text_subtitle_inputs = {
+            "mov_text",
+            "webvtt",
+            "subrip",
+            "ass",
+            "ssa",
+            "text",
+            "sami",
+            "microdvd",
+            "mpl2",
+            "jacosub",
+            "realtext",
+            "subviewer",
+            "subviewer1",
+            "vplayer",
+            "pjs",
+        }
         subtitle_codecs = {
-            "mp4": {"mov_text", "webvtt"},
+            "mp4": mp4_text_subtitle_inputs,
             "mkv": None,
-            "mov": {"mov_text", "webvtt"},
+            "mov": mp4_text_subtitle_inputs,
             "webm": {"webvtt"},
             "avi": set(),
             "mpeg": set(),
@@ -1295,9 +1839,84 @@ class VideoEditorWindow(QMainWindow):
     def update_web_optimize_enabled(self, _text: str | None = None) -> None:
         supported = self.format_combo.currentText().strip().lstrip(".").lower() in {"mp4", "mov"}
         self.web_optimize_check.setEnabled(supported)
-        self.web_optimize_description.setEnabled(supported)
         if not supported:
             self.web_optimize_check.setChecked(False)
+
+    def update_export_video_summary(self, *_args) -> None:
+        """Show the chosen video export settings in the Export tab."""
+        values = {
+            "Container": self.format_combo.currentText(),
+            "Video": self.video_codec_combo.currentText() or "Encoder unavailable",
+            "RF": str(self.rf_slider.value()),
+            "Frame rate": self.frame_rate_combo.currentText(),
+            "Color": self.color_range_combo.currentText(),
+        }
+        for setting, value in values.items():
+            row = self.video_review_rows.get(setting)
+            if row is not None:
+                row.setText(f"{setting}: {value}")
+
+    def update_export_audio_summary(self, *_args) -> None:
+        """Show the chosen audio export settings in the Export tab."""
+        selected_tracks = [
+            check.text() for _, check in self.audio_checks if check.isChecked()
+        ]
+        if selected_tracks:
+            track_summary = "; ".join(selected_tracks)
+        else:
+            track_summary = ""
+
+        copying_audio = self.audio_codec_combo.currentData() == "copy"
+        values = {
+            "Encoder": self.audio_codec_combo.currentText() or "Encoder unavailable",
+            "Tracks": track_summary,
+            "Output layout": (
+                "Copied from source" if copying_audio
+                else self.audio_channels_combo.currentText()
+            ),
+            "Bit rate": (
+                "Copied from source" if copying_audio
+                else f"{self.audio_bitrate_combo.currentText()} per track"
+            ),
+        }
+        for setting, value in values.items():
+            row = self.audio_review_rows.get(setting)
+            if row is not None:
+                row.setText(f"{setting}: {value}")
+        tracks_row = self.audio_review_rows.get("Tracks")
+        if tracks_row is not None:
+            tracks_row.setVisible(bool(selected_tracks))
+
+    def update_export_subtitle_summary(self, *_args) -> None:
+        """List the selected subtitle tracks in the Export tab."""
+        layout = getattr(self, "subtitle_review_tracks_layout", None)
+        if layout is None:
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        selected_tracks = [
+            check.text() for _, check in self.subtitle_checks if check.isChecked()
+        ]
+        if selected_tracks:
+            track_labels = selected_tracks
+        elif self.subtitle_checks:
+            track_labels = ["None selected"]
+        elif self.current_path:
+            track_labels = ["No subtitle tracks in the source"]
+        else:
+            track_labels = []
+
+        self.subtitle_review_tracks_heading.setVisible(bool(self.current_path))
+
+        for text in track_labels:
+            row = QLabel(text)
+            row.setIndent(8)
+            row.setWordWrap(True)
+            layout.addWidget(row)
 
     def open_dialog(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -1378,10 +1997,24 @@ class VideoEditorWindow(QMainWindow):
         )
         if is_different_video:
             self.reset_settings_for_new_video()
+        self._trim_frame_source_generation += 1
+        self.trim_frame_timer.stop()
+        if self._trim_frame_process and self._trim_frame_process.state() != QProcess.ProcessState.NotRunning:
+            self._trim_frame_process.kill()
+        self._trim_frame_process = None
+        self._trim_preview_pending_position = 0
         self.current_path = path
         self.media_info = info
         duration = float(info.get("format", {}).get("duration", 0) or 0)
         self.duration_ms = int(duration * 1000)
+        self.trim_range_slider.set_duration(self.duration_ms, reset=is_different_video)
+        self.trim_range_slider.setEnabled(self.duration_ms > 0)
+        self.trim_start_spin.setEnabled(self.duration_ms > 0)
+        self.trim_end_spin.setEnabled(self.duration_ms > 0)
+        self.trim_preview_active = False
+        self.trim_preview_button.setText("Preview trim")
+        self.trim_preview_button.setEnabled(self.duration_ms > 0)
+        self.reset_trim_button.setEnabled(self.duration_ms > 0)
         self.update_summary(path, info)
         self.position_slider.setRange(0, self.duration_ms)
         self.media_label.setText(
@@ -1391,7 +2024,7 @@ class VideoEditorWindow(QMainWindow):
             f"{self.format_color_range(video.get('color_range'))} color range"
         )
         self.populate_track_checks(streams)
-        self.settings_at_load = self.current_preset_data()
+        self.settings_at_load = self.current_unsaved_state()
         self.player.stop()
         self._last_source_frame = None
         self._current_preview_image = None
@@ -1432,7 +2065,7 @@ class VideoEditorWindow(QMainWindow):
         audio_codec_index = self.audio_codec_combo.findData("aac")
         if audio_codec_index >= 0:
             self.audio_codec_combo.setCurrentIndex(audio_codec_index)
-        channels_index = self.audio_channels_combo.findData(0)
+        channels_index = self.audio_channels_combo.findData(2)
         if channels_index >= 0:
             self.audio_channels_combo.setCurrentIndex(channels_index)
         bitrate_index = self.audio_bitrate_combo.findData(256)
@@ -1516,6 +2149,10 @@ class VideoEditorWindow(QMainWindow):
             check = QCheckBox(label)
             check.setChecked(True)
             check.toggled.connect(self.update_container_options)
+            if kind == "audio":
+                check.toggled.connect(self.update_export_audio_summary)
+            else:
+                check.toggled.connect(self.update_export_subtitle_summary)
             target_layout = (
                 self.audio_tracks_layout if kind == "audio" else self.subtitle_tracks_layout
             )
@@ -1528,6 +2165,8 @@ class VideoEditorWindow(QMainWindow):
         if not self.subtitle_checks:
             self.subtitle_tracks_layout.addWidget(QLabel("No subtitle tracks found."))
         self.update_container_options()
+        self.update_export_audio_summary()
+        self.update_export_subtitle_summary()
 
     def on_video_frame(self, frame) -> None:
         image = frame.toImage()
@@ -1637,7 +2276,7 @@ class VideoEditorWindow(QMainWindow):
             if getattr(self, "_current_preview_image", None) is not None:
                 self.preview.set_frame(self._current_preview_image)
             self.preview_stack.setCurrentIndex(1 if self.comparison_active else 0)
-            self.pop_out_button.setText("Pop out preview")
+            self.pop_out_button.setText("Float")
         else:
             self.preview_stack.setCurrentIndex(2)
             self.preview_window.set_comparison_view(self.comparison_active)
@@ -1650,13 +2289,13 @@ class VideoEditorWindow(QMainWindow):
             self.preview_window.activateWindow()
             if self.picture_float_window.isVisible():
                 self.picture_float_window.raise_()
-            self.pop_out_button.setText("Close preview window")
+            self.pop_out_button.setText("Restore")
 
     def on_preview_window_closed(self) -> None:
         if getattr(self, "_current_preview_image", None) is not None:
             self.preview.set_frame(self._current_preview_image)
         self.preview_stack.setCurrentIndex(1 if self.comparison_active else 0)
-        self.pop_out_button.setText("Pop out preview")
+        self.pop_out_button.setText("Float")
 
     def toggle_preview_mode(self) -> None:
         self.comparison_active = not self.comparison_active
@@ -1671,8 +2310,150 @@ class VideoEditorWindow(QMainWindow):
         self.position_slider.setRange(0, duration)
         self.picture_position_slider.setRange(0, duration)
         self.duration_ms = duration
+        self.trim_range_slider.set_duration(duration)
+
+    def update_trim_label(self, start_ms: int, end_ms: int) -> None:
+        selected_ms = max(0, end_ms - start_ms)
+        start_seconds = round(start_ms / 1000)
+        end_seconds = round(end_ms / 1000)
+        duration_seconds = round(self.duration_ms / 1000)
+        self.trim_start_spin.blockSignals(True)
+        self.trim_end_spin.blockSignals(True)
+        self.trim_start_spin.setRange(0, max(0, end_seconds - 1))
+        self.trim_end_spin.setRange(min(duration_seconds, start_seconds + 1), duration_seconds)
+        self.trim_start_spin.setValue(start_seconds)
+        self.trim_end_spin.setValue(end_seconds)
+        self.trim_start_spin.blockSignals(False)
+        self.trim_end_spin.blockSignals(False)
+        self.trim_range_label.setText(f"Selected: {self.format_time(selected_ms)}")
+
+    def preview_trim_position(self, position_ms: int) -> None:
+        if not self._trim_handle_dragging:
+            if self.player.isPlaying():
+                self.player.pause()
+            self.trim_preview_active = False
+            self.trim_preview_button.setText("Preview trim")
+        self.player.setPosition(position_ms)
+        self._trim_preview_pending_position = position_ms
+        if not self._trim_frame_process:
+            self.trim_frame_timer.start()
+
+    def begin_trim_handle_drag(self) -> None:
+        self._trim_handle_dragging = True
+        self.trim_preview_active = False
+        self.trim_preview_button.setText("Preview trim")
+        if self.player.isPlaying():
+            self.player.pause()
+
+    def finish_trim_handle_drag(self) -> None:
+        self._trim_handle_dragging = False
+        if self.player.isPlaying():
+            self.player.pause()
+
+    def decode_trim_preview_frame(self) -> None:
+        if self._trim_frame_process or not self.current_path:
+            return
+        ffmpeg = media_tool("ffmpeg")
+        if not ffmpeg:
+            return
+        position_ms = self._trim_preview_pending_position
+        source_generation = self._trim_frame_source_generation
+        process = QProcess(self)
+        self._trim_frame_process = process
+        process.setProgram(ffmpeg)
+        process.setArguments([
+            "-v", "error",
+            "-ss", f"{position_ms / 1000:.3f}",
+            "-i", self.current_path,
+            "-map", "0:v:0",
+            "-frames:v", "1",
+            "-vf", "scale=960:540:force_original_aspect_ratio=decrease",
+            "-f", "image2pipe",
+            "-vcodec", "png",
+            "pipe:1",
+        ])
+        process.finished.connect(
+            lambda _code, _status, p=process, g=source_generation, pos=position_ms:
+                self.trim_preview_frame_finished(p, g, pos)
+        )
+        process.errorOccurred.connect(
+            lambda _error, p=process, g=source_generation, pos=position_ms:
+                self.trim_preview_frame_failed(p, g, pos)
+        )
+        process.start()
+
+    def trim_preview_frame_finished(
+        self, process: QProcess, source_generation: int, requested_position: int
+    ) -> None:
+        image_data = bytes(process.readAllStandardOutput())
+        if self._trim_frame_process is process:
+            self._trim_frame_process = None
+        process.deleteLater()
+        if source_generation == self._trim_frame_source_generation and image_data:
+            image = QImage.fromData(image_data, "PNG")
+            if not image.isNull():
+                self._last_source_frame = image.convertToFormat(QImage.Format.Format_RGB888)
+                self.on_video_frame_from_image(self._last_source_frame)
+        if (
+            source_generation == self._trim_frame_source_generation
+            and self._trim_preview_pending_position != requested_position
+        ):
+            self.trim_frame_timer.start()
+
+    def trim_preview_frame_failed(
+        self, process: QProcess, source_generation: int, requested_position: int
+    ) -> None:
+        if self._trim_frame_process is process:
+            self._trim_frame_process = None
+        process.deleteLater()
+        if (
+            source_generation == self._trim_frame_source_generation
+            and self._trim_preview_pending_position != requested_position
+        ):
+            self.trim_frame_timer.start()
+
+    def preview_trim(self) -> None:
+        if self.trim_preview_active:
+            self.player.pause()
+            self.trim_preview_active = False
+            self.trim_preview_button.setText("Preview trim")
+            return
+        start_ms = self.trim_range_slider.start_ms
+        end_ms = self.trim_range_slider.end_ms
+        if not self.current_path or end_ms <= start_ms:
+            return
+        if self.player.isPlaying() and not self._trim_handle_dragging:
+            self.player.pause()
+        self.trim_preview_active = True
+        self.trim_preview_button.setText("Stop preview")
+        self.player.setPosition(start_ms)
+        self.player.play()
+
+    def current_unsaved_state(self) -> dict:
+        state = self.current_preset_data()
+        state["_trim_range_ms"] = [
+            self.trim_range_slider.start_ms,
+            self.trim_range_slider.end_ms,
+        ]
+        return state
 
     def set_position(self, position: int) -> None:
+        if self.player.isPlaying() and not self._trim_handle_dragging:
+            trim_start = self.trim_range_slider.start_ms
+            trim_end = self.trim_range_slider.end_ms
+            if position < trim_start:
+                self.player.setPosition(trim_start)
+                position = trim_start
+            elif trim_end > trim_start and position >= trim_end:
+                self.player.pause()
+                if self.trim_preview_active:
+                    self.trim_preview_active = False
+                    self.trim_preview_button.setText("Preview trim")
+                    self.player.setPosition(trim_end)
+                    position = trim_end
+                else:
+                    self.player.setPosition(trim_start)
+                    position = trim_start
         if not self.position_slider.isSliderDown():
             self.position_slider.setValue(position)
         if not self.picture_position_slider.isSliderDown():
@@ -1809,20 +2590,51 @@ class VideoEditorWindow(QMainWindow):
         return {"tv": "limited", "pc": "full"}.get(value, "unspecified")
 
     def seek_by(self, offset: int) -> None:
-        self.player.setPosition(max(0, self.player.position() + offset))
+        start = self.trim_range_slider.start_ms
+        end = self.trim_range_slider.end_ms or self.duration_ms
+        self.player.setPosition(min(end, max(start, self.player.position() + offset)))
+
+    def set_preview_volume(self, value: int) -> None:
+        self.audio_output.setVolume(value / 100.0)
+        for slider in (self.preview_volume_slider, self.picture_volume_slider):
+            if slider.value() != value:
+                slider.blockSignals(True)
+                slider.setValue(value)
+                slider.blockSignals(False)
 
     def toggle_playback(self) -> None:
         if self.player.isPlaying():
             self.player.pause()
+            self.trim_preview_active = False
+            self.trim_preview_button.setText("Preview trim")
         else:
+            trim_start = self.trim_range_slider.start_ms
+            trim_end = self.trim_range_slider.end_ms
+            if self.player.position() < trim_start or self.player.position() >= trim_end:
+                self.player.setPosition(trim_start)
             self.player.play()
 
     def update_play_button(self, state: QMediaPlayer.PlaybackState) -> None:
-        button_text = (
-            "Pause" if state == QMediaPlayer.PlaybackState.PlayingState else "Play"
+        is_playing = state == QMediaPlayer.PlaybackState.PlayingState
+        self.play_button.setIcon(
+            self.style().standardIcon(
+                QStyle.StandardPixmap.SP_MediaPause
+                if is_playing
+                else QStyle.StandardPixmap.SP_MediaPlay
+            )
         )
-        self.play_button.setText(button_text)
-        self.picture_play_button.setText(button_text)
+        action = "Pause" if is_playing else "Play"
+        self.play_button.setToolTip(f"{action} video")
+        self.play_button.setAccessibleName(f"{action} video")
+        self.picture_play_button.setIcon(
+            self.style().standardIcon(
+                QStyle.StandardPixmap.SP_MediaPause
+                if is_playing
+                else QStyle.StandardPixmap.SP_MediaPlay
+            )
+        )
+        self.picture_play_button.setToolTip(f"{action} video")
+        self.picture_play_button.setAccessibleName(f"{action} video")
 
     def ffmpeg_filters(self) -> str | None:
         values = {key: slider.value() for key, slider in self.adjustment_sliders.items()}
@@ -1887,11 +2699,25 @@ class VideoEditorWindow(QMainWindow):
             )
             return
 
+        trim_start_ms = self.trim_range_slider.start_ms
+        trim_end_ms = self.trim_range_slider.end_ms
+        trim_duration_ms = trim_end_ms - trim_start_ms
+        if trim_duration_ms <= 0:
+            QMessageBox.warning(self, "Invalid trim range", "Choose an export range longer than zero.")
+            return
+
         ffmpeg = media_tool("ffmpeg")
         if not ffmpeg:
             QMessageBox.critical(self, "FFmpeg is required", "The FFmpeg executable could not be found.")
             return
-        command = [ffmpeg, "-hide_banner", "-y", "-i", self.current_path]
+        command = [ffmpeg, "-hide_banner", "-y"]
+        if trim_start_ms > 0:
+            # Input-side seeking is fast. FFmpeg seeks accurately while re-encoding;
+            # stream copy is limited by the media's keyframes.
+            command += ["-ss", f"{trim_start_ms / 1000:.3f}"]
+        command += ["-i", self.current_path]
+        if trim_start_ms > 0 or trim_end_ms < self.duration_ms:
+            command += ["-t", f"{trim_duration_ms / 1000:.3f}"]
         video_stream = next(
             s for s in self.media_info["streams"] if s.get("codec_type") == "video"
         )
@@ -1912,6 +2738,8 @@ class VideoEditorWindow(QMainWindow):
         elif video_codec in ("h264_nvenc", "hevc_nvenc"):
             cq_value = max(1, self.rf_slider.value())
             command += ["-rc", "vbr", "-cq", str(cq_value), "-b:v", "0"]
+        if video_codec == "h264_nvenc":
+            command += ["-pix_fmt", "yuv420p"]
         if video_codec != "copy":
             frame_rate = self.frame_rate_combo.currentData()
             if frame_rate is None:
@@ -1930,12 +2758,17 @@ class VideoEditorWindow(QMainWindow):
             if audio_codec != "copy":
                 command += ["-b:a", f"{self.audio_bitrate_combo.currentData()}k"]
         if any(check.isChecked() for _, check in self.subtitle_checks):
-            command += ["-c:s", "copy"]
+            subtitle_codec = (
+                "mov_text"
+                if self.format_combo.currentText().strip().lower() in {"mp4", "mov"}
+                else "copy"
+            )
+            command += ["-c:s", subtitle_codec]
         if self.web_optimize_check.isChecked() and ext.lower() in {"mp4", "mov"}:
             command += ["-movflags", "+faststart"]
         command += ["-progress", "pipe:1", "-nostats", str(output_path)]
 
-        duration_ms = int(float(self.media_info.get("format", {}).get("duration", 0) or 0) * 1000)
+        duration_ms = trim_duration_ms
         self.export_progress.setValue(0)
         self.export_estimate.setText("Estimated time remaining: calculating…")
         self.statusBar().showMessage("Exporting…")
@@ -1993,6 +2826,11 @@ class VideoEditorWindow(QMainWindow):
         self.file_menu.setEnabled(not locked)
         self.adjustments_group.setEnabled(not locked)
         self.position_slider.setEnabled(not locked)
+        self.trim_range_slider.setEnabled(not locked and self.duration_ms > 0)
+        self.trim_start_spin.setEnabled(not locked and self.duration_ms > 0)
+        self.trim_end_spin.setEnabled(not locked and self.duration_ms > 0)
+        self.trim_preview_button.setEnabled(not locked and self.duration_ms > 0)
+        self.reset_trim_button.setEnabled(not locked and self.duration_ms > 0)
         self.seek_back_button.setEnabled(not locked)
         self.play_button.setEnabled(not locked)
         self.seek_forward_button.setEnabled(not locked)
@@ -2002,7 +2840,6 @@ class VideoEditorWindow(QMainWindow):
         self.export_button.setText("Stop encode" if locked else "Encode video")
         web_faststart_supported = self.format_combo.currentText().strip().lstrip(".").lower() in {"mp4", "mov"}
         self.web_optimize_check.setEnabled(not locked and web_faststart_supported)
-        self.web_optimize_description.setEnabled(not locked and web_faststart_supported)
         self.setAcceptDrops(not locked)
         self.splitter.handle(1).setEnabled(not locked)
 
@@ -2054,7 +2891,7 @@ class VideoEditorWindow(QMainWindow):
         if (
             self.current_path
             and self.settings_at_load is not None
-            and self.current_preset_data() != self.settings_at_load
+            and self.current_unsaved_state() != self.settings_at_load
         ):
             dialog = QMessageBox(self)
             dialog.setIcon(QMessageBox.Icon.Warning)
@@ -2098,6 +2935,16 @@ def main() -> int:
     if icon_path.is_file():
         window.setWindowIcon(QIcon(str(icon_path)))
     window.show()
+    video_path = next(
+        (
+            argument
+            for argument in sys.argv[1:]
+            if not argument.startswith("-") and Path(argument).is_file()
+        ),
+        None,
+    )
+    if video_path:
+        QTimer.singleShot(0, lambda: window.load_video(video_path))
     return app.exec()
 
 
