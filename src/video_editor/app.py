@@ -55,7 +55,7 @@ from PySide6.QtWidgets import (
 )
 
 # Current product version shown in About and application metadata.
-APP_VERSION = "10.6.0.8"
+APP_VERSION = "10.6.0.9"
 
 
 def probe_media(path: str) -> dict:
@@ -120,18 +120,22 @@ class PreviewLabel(QLabel):
         super().__init__("Drop a video here, or choose File → Open Video")
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumSize(480, 270)
+        # Paint an opaque black surface immediately, including while a video
+        # opened from the file manager is still being loaded by Qt Multimedia.
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.setAutoFillBackground(True)
         self.setStyleSheet("border: 1px solid palette(mid)")
         self._frame: QPixmap | None = None
 
     def set_theme(self, dark: bool) -> None:
-        background, foreground, border = (
-            ("#111315", "#c7c9cc", "#45474d")
-            if dark
-            else ("#e7e9ed", "#30343a", "#b8bdc5")
-        )
+        foreground, border = ("#e6e6e6", "#45474d") if dark else ("#e6e6e6", "#b8bdc5")
         self.setStyleSheet(
-            f"background: {background}; color: {foreground}; border: 1px solid {border}"
+            f"background-color: #000000; color: {foreground}; border: 1px solid {border}"
         )
+        palette = self.palette()
+        palette.setColor(QPalette.ColorRole.Window, QColor("#000000"))
+        palette.setColor(QPalette.ColorRole.WindowText, QColor(foreground))
+        self.setPalette(palette)
 
     def set_frame(self, image: QImage) -> None:
         self._frame = QPixmap.fromImage(image)

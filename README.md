@@ -1,6 +1,6 @@
 # Muxy
 
-Current desktop version: **10.6.0.8** (Python 3.12 / PySide6).
+Current desktop version: **10.6.0.9** (Python 3.12 / PySide6).
 
 Muxy is a desktop video editor and converter for Linux. It uses FFmpeg for video processing and PySide6 for its graphical interface.
 
