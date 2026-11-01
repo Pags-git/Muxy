@@ -2,7 +2,7 @@
 
 Current desktop version: **10.6.0.9** (Python 3.12 / PySide6).
 
-Muxy is a desktop video editor and converter for Linux. It uses FFmpeg for video processing and PySide6 for its graphical interface.
+Muxy is a desktop video editor and converter for Linux and Windows. It uses FFmpeg for video processing and PySide6 for its graphical interface.
 
 ## Requirements
 
