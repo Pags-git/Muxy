@@ -46,6 +46,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QStyle,
+    QStyleOptionSlider,
     QSlider,
     QStackedWidget,
     QSplitter,
@@ -55,7 +56,7 @@ from PySide6.QtWidgets import (
 )
 
 # Current product version shown in About and application metadata.
-APP_VERSION = "10.6.0.9"
+APP_VERSION = "10.6.0.12"
 
 
 def probe_media(path: str) -> dict:
@@ -159,6 +160,67 @@ class PreviewLabel(QLabel):
                     Qt.TransformationMode.SmoothTransformation,
                 )
             )
+
+
+class SeekSlider(QSlider):
+    """Horizontal video seek slider that jumps to track clicks and remains draggable."""
+
+    def __init__(self, orientation: Qt.Orientation, parent: QWidget | None = None) -> None:
+        super().__init__(orientation, parent)
+        self._mouse_seek_active = False
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self.isEnabled()
+            and self.maximum() > self.minimum()
+        ):
+            self._mouse_seek_active = True
+            self.setSliderDown(True)
+            self._seek_to_x(event.position().toPoint().x())
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if self._mouse_seek_active and event.buttons() & Qt.MouseButton.LeftButton:
+            self._seek_to_x(event.position().toPoint().x())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if self._mouse_seek_active and event.button() == Qt.MouseButton.LeftButton:
+            self._seek_to_x(event.position().toPoint().x())
+            self._mouse_seek_active = False
+            self.setSliderDown(False)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def _seek_to_x(self, x: int) -> None:
+        option = QStyleOptionSlider()
+        self.initStyleOption(option)
+        groove = self.style().subControlRect(
+            QStyle.ComplexControl.CC_Slider,
+            option,
+            QStyle.SubControl.SC_SliderGroove,
+            self,
+        )
+        handle = self.style().subControlRect(
+            QStyle.ComplexControl.CC_Slider,
+            option,
+            QStyle.SubControl.SC_SliderHandle,
+            self,
+        )
+        minimum_x = groove.x()
+        span = max(1, groove.width() - handle.width())
+        position = x - minimum_x - handle.width() // 2
+        value = QStyle.sliderValueFromPosition(
+            self.minimum(), self.maximum(), position, span, option.upsideDown
+        )
+        self.setValue(value)
+        self.sliderMoved.emit(value)
 
 
 class TrimRangeSlider(QWidget):
@@ -488,12 +550,16 @@ class VideoEditorWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Muxy")
+        # Give the top-level window a fully painted background on its first
+        # frame, including when launched with a file from the file manager.
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.setAutoFillBackground(True)
         screen = QApplication.primaryScreen()
         available = screen.availableGeometry() if screen else None
         available_width = available.width() if available else 1600
         available_height = available.height() if available else 1000
-        startup_width = min(1280, available_width)
-        startup_height = min(650, available_height)
+        startup_width = min(1284, available_width)
+        startup_height = min(659, available_height)
         self.resize(startup_width, startup_height)
         self.setMinimumSize(startup_width, startup_height)
         self.setAcceptDrops(True)
@@ -537,7 +603,7 @@ class VideoEditorWindow(QMainWindow):
         self.before_preview.setMinimumSize(320, 180)
         self.preview.setMinimumSize(320, 180)
         self.comparison_active = False
-        self.position_slider = QSlider(Qt.Orientation.Horizontal)
+        self.position_slider = SeekSlider(Qt.Orientation.Horizontal)
         self.position_slider.setRange(0, 0)
         self.position_slider.sliderMoved.connect(self.player.setPosition)
         self.time_label = QLabel("00:00 / 00:00")
@@ -576,7 +642,7 @@ class VideoEditorWindow(QMainWindow):
         self.summary_file_label: QLabel | None = None
         self.summary_video_label: QLabel | None = None
         self.summary_audio_label: QLabel | None = None
-        self.summary_subtitle_label: QLabel | None = None
+        self.summary_subtitle_rows_layout: QVBoxLayout | None = None
 
         self.play_button = QPushButton()
         self.play_button.setIcon(
@@ -704,6 +770,7 @@ class VideoEditorWindow(QMainWindow):
         self.splitter.setStretchFactor(1, 2)
         self.splitter.setSizes([960, 620])
         self.setCentralWidget(self.splitter)
+        self.splitter.setAutoFillBackground(True)
 
         self.file_menu = self.menuBar().addMenu("&File")
         open_action = QAction("Open Video…", self)
@@ -816,6 +883,12 @@ class VideoEditorWindow(QMainWindow):
         for role, color in palette_colors.items():
             app_palette.setColor(role, QColor(color))
         self.app.setPalette(app_palette)
+        window_palette = QPalette(self.palette())
+        window_palette.setColor(QPalette.ColorRole.Window, QColor(window))
+        self.setPalette(window_palette)
+        self.setAutoFillBackground(True)
+        self.splitter.setPalette(window_palette)
+        self.splitter.setAutoFillBackground(True)
 
         stylesheet = (
             f"QMainWindow {{ background: {window}; }} QWidget {{ color: {foreground}; }}"
@@ -839,6 +912,21 @@ class VideoEditorWindow(QMainWindow):
         )
         for window_widget in (self, self.preview_window, self.picture_float_window):
             window_widget.setStyleSheet(stylesheet)
+
+        scroll_background = QColor(window)
+        for scroll_area in (
+            self.summary_subtitle_scroll,
+            self.subtitle_tracks_scroll,
+            self.subtitle_review_tracks_scroll,
+        ):
+            for surface in (scroll_area, scroll_area.viewport(), scroll_area.widget()):
+                if surface is None:
+                    continue
+                surface_palette = QPalette(surface.palette())
+                surface_palette.setColor(QPalette.ColorRole.Window, scroll_background)
+                surface_palette.setColor(QPalette.ColorRole.Base, scroll_background)
+                surface.setPalette(surface_palette)
+                surface.setAutoFillBackground(True)
 
         preview_labels = [
             self.preview,
@@ -1215,11 +1303,8 @@ class VideoEditorWindow(QMainWindow):
         return box
 
     def make_controls_panel(self) -> QWidget:
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setMinimumWidth(580)
         panel = QWidget()
-        panel.setMinimumWidth(550)
+        panel.setMinimumWidth(580)
         layout = QVBoxLayout(panel)
         self.export_tabs = QTabWidget()
 
@@ -1245,10 +1330,25 @@ class VideoEditorWindow(QMainWindow):
         summary_audio_layout.addWidget(self.summary_audio_label)
         summary_subtitle_group = QGroupBox("Subtitle tracks")
         summary_subtitle_layout = QVBoxLayout(summary_subtitle_group)
-        self.summary_subtitle_label = QLabel("No subtitle tracks found.")
-        self.summary_subtitle_label.setWordWrap(True)
-        self.summary_subtitle_label.setTextFormat(Qt.TextFormat.PlainText)
-        summary_subtitle_layout.addWidget(self.summary_subtitle_label)
+        self.summary_subtitle_scroll = QScrollArea()
+        self.summary_subtitle_scroll.setWidgetResizable(True)
+        self.summary_subtitle_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.summary_subtitle_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        subtitle_lines_visible = 10
+        subtitle_scroll_height = (
+            subtitle_lines_visible * self.fontMetrics().lineSpacing()
+        )
+        self.summary_subtitle_scroll.setMinimumHeight(subtitle_scroll_height)
+        self.summary_subtitle_scroll.setMaximumHeight(subtitle_scroll_height)
+        summary_subtitle_rows = QWidget()
+        self.summary_subtitle_rows_layout = QVBoxLayout(summary_subtitle_rows)
+        self.summary_subtitle_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self.summary_subtitle_rows_layout.setSpacing(2)
+        self.summary_subtitle_rows_layout.addWidget(QLabel("No subtitle tracks found."))
+        self.summary_subtitle_scroll.setWidget(summary_subtitle_rows)
+        summary_subtitle_layout.addWidget(self.summary_subtitle_scroll)
         for group in (summary_file_group, summary_video_group, summary_audio_group, summary_subtitle_group):
             summary_layout.addWidget(group)
         summary_layout.addStretch(1)
@@ -1368,7 +1468,7 @@ class VideoEditorWindow(QMainWindow):
         picture_volume_row.addStretch(1)
         picture_transport.addWidget(picture_volume_row_widget, 1, 1, 1, 3)
         grid.addWidget(picture_transport_widget, 7, 0, 2, 3)
-        self.picture_position_slider = QSlider(Qt.Orientation.Horizontal)
+        self.picture_position_slider = SeekSlider(Qt.Orientation.Horizontal)
         self.picture_position_slider.setRange(0, 0)
         self.picture_position_slider.setToolTip("Scrub through the video")
         self.picture_position_slider.sliderMoved.connect(self.player.setPosition)
@@ -1423,7 +1523,6 @@ class VideoEditorWindow(QMainWindow):
         )
 
         self.frame_rate_combo = QComboBox()
-        self.frame_rate_combo.addItem("Same as source", None)
         for label, value in (
             ("15 fps", "15"),
             ("23.976 fps", "24000/1001"),
@@ -1439,6 +1538,7 @@ class VideoEditorWindow(QMainWindow):
             ("120 fps", "120"),
         ):
             self.frame_rate_combo.addItem(label, value)
+        self.frame_rate_combo.setCurrentIndex(self.frame_rate_combo.findData("30"))
 
         self.color_range_combo = QComboBox()
         self.color_range_combo.addItem("Same as source", None)
@@ -1510,8 +1610,15 @@ class VideoEditorWindow(QMainWindow):
         self.subtitle_tracks_layout.addWidget(
             QLabel("Load a video to inspect its subtitle tracks.")
         )
-        subtitles_tab_layout.addWidget(subtitle_tracks_group)
-        subtitles_tab_layout.addStretch(1)
+        self.subtitle_tracks_scroll = QScrollArea()
+        self.subtitle_tracks_scroll.setWidgetResizable(True)
+        self.subtitle_tracks_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.subtitle_tracks_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.subtitle_tracks_scroll.setMinimumHeight(0)
+        self.subtitle_tracks_scroll.setWidget(subtitle_tracks_group)
+        subtitles_tab_layout.addWidget(self.subtitle_tracks_scroll, 1)
 
         export_tab = QWidget()
         export_layout = QVBoxLayout(export_tab)
@@ -1584,7 +1691,7 @@ class VideoEditorWindow(QMainWindow):
         export_layout.addWidget(audio_review_group)
         export_layout.addWidget(subtitle_review_group)
         export_layout.addWidget(self.web_optimize_check)
-        export_layout.addSpacing(5 * self.web_optimize_check.fontMetrics().lineSpacing())
+        export_layout.addSpacing(3 * self.web_optimize_check.fontMetrics().lineSpacing())
         export_layout.addLayout(output_row)
         export_layout.addWidget(self.export_progress)
         export_layout.addWidget(self.export_estimate)
@@ -1618,8 +1725,7 @@ class VideoEditorWindow(QMainWindow):
         self.export_tabs.addTab(presets_tab, "Presets")
         layout.addWidget(self.export_tabs)
 
-        scroll.setWidget(panel)
-        return scroll
+        return panel
 
     def reset_adjustments(self) -> None:
         for slider in self.adjustment_sliders.values():
@@ -2059,7 +2165,7 @@ class VideoEditorWindow(QMainWindow):
         if video_codec_index >= 0:
             self.video_codec_combo.setCurrentIndex(video_codec_index)
         self.rf_slider.setValue(22)
-        frame_rate_index = self.frame_rate_combo.findData(None)
+        frame_rate_index = self.frame_rate_combo.findData("30")
         if frame_rate_index >= 0:
             self.frame_rate_combo.setCurrentIndex(frame_rate_index)
         color_range_index = self.color_range_combo.findData(None)
@@ -2574,9 +2680,20 @@ class VideoEditorWindow(QMainWindow):
             labels = [f"Subtitle {number}: {stream.get('codec_name', 'unknown format')}"]
             labels.extend(value for value in (title, language) if value and value != "und")
             subtitle_lines.append(" · ".join(labels))
-        self.summary_subtitle_label.setText(
-            "\n".join(subtitle_lines) if subtitle_lines else "No subtitle tracks found."
-        )
+        subtitle_rows = subtitle_lines or ["No subtitle tracks found."]
+        layout = self.summary_subtitle_rows_layout
+        if layout is not None:
+            while layout.count():
+                item = layout.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.deleteLater()
+            for text in subtitle_rows:
+                row = QLabel(text)
+                row.setWordWrap(True)
+                row.setTextFormat(Qt.TextFormat.PlainText)
+                layout.addWidget(row)
+            layout.addStretch(1)
 
     @staticmethod
     def format_frame_rate(value: str | None) -> str:
@@ -2746,10 +2863,7 @@ class VideoEditorWindow(QMainWindow):
             command += ["-pix_fmt", "yuv420p"]
         if video_codec != "copy":
             frame_rate = self.frame_rate_combo.currentData()
-            if frame_rate is None:
-                command += ["-fps_mode", "passthrough"]
-            else:
-                command += ["-r", frame_rate, "-fps_mode", "cfr"]
+            command += ["-r", frame_rate, "-fps_mode", "cfr"]
             color_range = self.color_range_combo.currentData()
             if color_range:
                 command += ["-color_range", color_range]
@@ -2939,6 +3053,10 @@ def main() -> int:
     if icon_path.is_file():
         window.setWindowIcon(QIcon(str(icon_path)))
     window.show()
+    # Paint the opaque window before probing a file passed by the file manager.
+    # probe_media runs synchronously, so an immediate timer can block the very
+    # first paint and leave the desktop visible while the file is inspected.
+    app.processEvents()
     video_path = next(
         (
             argument
@@ -2948,7 +3066,7 @@ def main() -> int:
         None,
     )
     if video_path:
-        QTimer.singleShot(0, lambda: window.load_video(video_path))
+        QTimer.singleShot(150, lambda: window.load_video(video_path))
     return app.exec()
 
 
