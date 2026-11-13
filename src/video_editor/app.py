@@ -16,6 +16,7 @@ from PIL import Image, ImageEnhance, ImageFilter
 from PySide6.QtCore import (
     QEvent,
     QObject,
+    QPropertyAnimation,
     QProcess,
     QSize,
     QStandardPaths,
@@ -42,8 +43,10 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressBar,
+    QGraphicsOpacityEffect,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QStyle,
     QStyleOptionSlider,
@@ -56,7 +59,7 @@ from PySide6.QtWidgets import (
 )
 
 # Current product version shown in About and application metadata.
-APP_VERSION = "10.6.0.12"
+APP_VERSION = "10.6.0.13"
 
 
 def probe_media(path: str) -> dict:
@@ -423,6 +426,10 @@ class PreviewWindow(QMainWindow):
     """Separate resizable window for the live video preview."""
 
     closed = Signal()
+    seekRequested = Signal(int)
+    playRequested = Signal()
+    rewindRequested = Signal()
+    forwardRequested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -450,7 +457,234 @@ class PreviewWindow(QMainWindow):
         comparison_layout.addWidget(before_panel, stretch=1)
         comparison_layout.addWidget(after_panel, stretch=1)
         self.preview_stack.addWidget(comparison_panel)
-        self.setCentralWidget(self.preview_stack)
+        self.controls_panel = QWidget()
+        self.controls_panel.setObjectName("previewControlsPanel")
+        self.controls_panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.controls_panel.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self.controls_panel.setMaximumWidth(640)
+        controls_layout = QVBoxLayout(self.controls_panel)
+        controls_layout.setContentsMargins(10, 6, 10, 6)
+        controls_layout.setSpacing(3)
+
+        self.position_slider = SeekSlider(Qt.Orientation.Horizontal)
+        self.position_slider.setRange(0, 0)
+        self.position_slider.setToolTip("Seek through the video")
+        self.position_slider.sliderMoved.connect(self.seekRequested.emit)
+        controls_layout.addWidget(self.position_slider)
+
+        transport = QHBoxLayout()
+        transport.setContentsMargins(0, 0, 0, 0)
+        transport.addStretch(1)
+        self.rewind_button = QPushButton()
+        self.rewind_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaSeekBackward)
+        )
+        self.rewind_button.setIconSize(QSize(20, 20))
+        self.rewind_button.setFixedSize(44, 36)
+        self.rewind_button.setToolTip("Rewind 5 seconds")
+        self.rewind_button.setAccessibleName("Rewind 5 seconds")
+        self.rewind_button.clicked.connect(self.rewindRequested.emit)
+        transport.addWidget(self.rewind_button)
+
+        self.play_button = QPushButton()
+        self.play_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
+        )
+        self.play_button.setIconSize(QSize(20, 20))
+        self.play_button.setFixedSize(44, 36)
+        self.play_button.setToolTip("Play video")
+        self.play_button.setAccessibleName("Play video")
+        self.play_button.clicked.connect(self.playRequested.emit)
+        transport.addWidget(self.play_button)
+
+        self.forward_button = QPushButton()
+        self.forward_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaSeekForward)
+        )
+        self.forward_button.setIconSize(QSize(20, 20))
+        self.forward_button.setFixedSize(44, 36)
+        self.forward_button.setToolTip("Forward 5 seconds")
+        self.forward_button.setAccessibleName("Forward 5 seconds")
+        self.forward_button.clicked.connect(self.forwardRequested.emit)
+        transport.addWidget(self.forward_button)
+
+        self.time_label = QLabel("00:00 / 00:00")
+        self.time_label.setStyleSheet("color: white; background: transparent;")
+        transport.addWidget(self.time_label)
+        transport.addStretch(1)
+        controls_layout.addLayout(transport)
+        self.controls_panel.setStyleSheet(
+            "QWidget#previewControlsPanel { background-color: rgba(12, 14, 17, 225);"
+            " border: 1px solid rgba(255, 255, 255, 55); border-radius: 14px; }"
+        )
+        self.controls_panel.setVisible(False)
+
+        overlay = QWidget()
+        overlay_layout = QGridLayout(overlay)
+        overlay_layout.setContentsMargins(0, 0, 0, 0)
+        overlay_layout.addWidget(self.preview_stack, 0, 0)
+        controls_layer = QWidget()
+        controls_layer.setMouseTracking(True)
+        controls_layer_layout = QVBoxLayout(controls_layer)
+        controls_layer_layout.setContentsMargins(16, 0, 16, 16)
+        controls_layer_layout.setSpacing(0)
+        controls_layer_layout.addStretch(1)
+        controls_layer_layout.addWidget(
+            self.controls_panel, alignment=Qt.AlignmentFlag.AlignHCenter
+        )
+        overlay_layout.addWidget(controls_layer, 0, 0)
+        self.setCentralWidget(overlay)
+
+        self.controls_opacity = QGraphicsOpacityEffect(self.controls_panel)
+        self.controls_opacity.setOpacity(0.0)
+        self.controls_panel.setGraphicsEffect(self.controls_opacity)
+        self.controls_animation = QPropertyAnimation(
+            self.controls_opacity, b"opacity", self
+        )
+        self.controls_animation.setDuration(700)
+        self.controls_animation.finished.connect(self._finish_controls_animation)
+        self._controls_animation_target = 0.0
+        self.controls_hide_timer = QTimer(self)
+        self.controls_hide_timer.setSingleShot(True)
+        self.controls_hide_timer.setInterval(1000)
+        self.controls_hide_timer.timeout.connect(self._fade_out_controls)
+        self._pointer_in_preview = False
+        self._pointer_over_controls = False
+
+        self._control_hover_widgets = [
+            self.controls_panel,
+            self.position_slider,
+            self.rewind_button,
+            self.play_button,
+            self.forward_button,
+            self.time_label,
+        ]
+        self._hover_widgets = [
+            self,
+            overlay,
+            controls_layer,
+            self.preview_stack,
+            self.preview,
+            comparison_panel,
+            before_panel,
+            self.before_preview,
+            after_panel,
+            self.comparison_after_preview,
+            *self._control_hover_widgets,
+        ]
+        for widget in self._hover_widgets:
+            widget.setMouseTracking(True)
+            widget.installEventFilter(self)
+        self._controls_layer = controls_layer
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().resizeEvent(event)
+        if hasattr(self, "_controls_layer"):
+            self._update_controls_panel_width()
+
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().showEvent(event)
+        self._update_controls_panel_width()
+
+    def _update_controls_panel_width(self) -> None:
+        available_width = max(1, self._controls_layer.width() - 32)
+        self.controls_panel.setFixedWidth(min(640, available_width))
+
+    def eventFilter(self, watched: QObject, event) -> bool:  # noqa: N802 - Qt override
+        if watched in self._hover_widgets:
+            if event.type() in (
+                QEvent.Type.Enter,
+                QEvent.Type.MouseMove,
+                QEvent.Type.MouseButtonPress,
+            ):
+                self._pointer_in_preview = True
+                if watched in self._control_hover_widgets:
+                    self._pointer_over_controls = True
+                self._show_controls()
+            elif event.type() == QEvent.Type.Leave:
+                if watched is self:
+                    self._pointer_in_preview = False
+                    self._pointer_over_controls = False
+                    self._fade_out_controls(force=True)
+                elif watched in self._control_hover_widgets:
+                    QTimer.singleShot(0, self._refresh_controls_hover)
+        return super().eventFilter(watched, event)
+
+    def _show_controls(self) -> None:
+        if not self._pointer_in_preview:
+            return
+        if not self.controls_panel.isVisible():
+            self.controls_animation.stop()
+            self.controls_opacity.setOpacity(0.0)
+            self.controls_panel.setVisible(True)
+        if self._controls_animation_target != 1.0:
+            self.controls_animation.stop()
+            self._controls_animation_target = 1.0
+            self.controls_animation.setStartValue(self.controls_opacity.opacity())
+            self.controls_animation.setEndValue(1.0)
+            self.controls_animation.start()
+        self._refresh_controls_hover()
+
+    def _refresh_controls_hover(self) -> None:
+        if not self._pointer_in_preview:
+            self._fade_out_controls(force=True)
+            return
+        self._pointer_over_controls = any(
+            widget.underMouse() for widget in self._control_hover_widgets
+        )
+        if self._pointer_over_controls:
+            self.controls_hide_timer.stop()
+        elif self.controls_panel.isVisible():
+            self.controls_hide_timer.start()
+
+    def _fade_out_controls(self, force: bool = False) -> None:
+        if (
+            not self.controls_panel.isVisible()
+            or (self._pointer_over_controls and not force)
+            or self._controls_animation_target == 0.0
+        ):
+            return
+        self.controls_hide_timer.stop()
+        self.controls_animation.stop()
+        self._controls_animation_target = 0.0
+        self.controls_animation.setStartValue(self.controls_opacity.opacity())
+        self.controls_animation.setEndValue(0.0)
+        self.controls_animation.start()
+
+    def _finish_controls_animation(self) -> None:
+        if (
+            self._controls_animation_target == 0.0
+            and self.controls_opacity.opacity() <= 0.01
+        ):
+            self.controls_panel.setVisible(False)
+
+    def set_duration(self, duration_ms: int) -> None:
+        self.position_slider.setRange(0, max(0, duration_ms))
+        has_video = duration_ms > 0
+        self.position_slider.setEnabled(has_video)
+        for button in (self.rewind_button, self.play_button, self.forward_button):
+            button.setEnabled(has_video)
+
+    def set_position(self, position_ms: int, duration_ms: int) -> None:
+        if not self.position_slider.isSliderDown():
+            self.position_slider.setValue(position_ms)
+        self.time_label.setText(
+            f"{VideoEditorWindow.format_time(position_ms)} / "
+            f"{VideoEditorWindow.format_time(duration_ms)}"
+        )
+
+    def set_playing(self, is_playing: bool) -> None:
+        action = "Pause" if is_playing else "Play"
+        icon = (
+            QStyle.StandardPixmap.SP_MediaPause
+            if is_playing
+            else QStyle.StandardPixmap.SP_MediaPlay
+        )
+        self.play_button.setIcon(self.style().standardIcon(icon))
+        self.play_button.setToolTip(f"{action} video")
+        self.play_button.setAccessibleName(f"{action} video")
 
     def set_comparison_view(self, enabled: bool) -> None:
         self.preview_stack.setCurrentIndex(1 if enabled else 0)
@@ -599,6 +833,11 @@ class VideoEditorWindow(QMainWindow):
 
         self.preview = PreviewLabel()
         self.preview_window = PreviewWindow()
+        self.preview_window.seekRequested.connect(self.player.setPosition)
+        self.preview_window.playRequested.connect(self.toggle_playback)
+        self.preview_window.rewindRequested.connect(lambda: self.seek_by(-5000))
+        self.preview_window.forwardRequested.connect(lambda: self.seek_by(5000))
+        self.preview_window.set_duration(0)
         self.before_preview = PreviewLabel()
         self.before_preview.setMinimumSize(320, 180)
         self.preview.setMinimumSize(320, 180)
@@ -2118,6 +2357,7 @@ class VideoEditorWindow(QMainWindow):
         duration = float(info.get("format", {}).get("duration", 0) or 0)
         self.duration_ms = int(duration * 1000)
         self.trim_range_slider.set_duration(self.duration_ms, reset=is_different_video)
+        self.preview_window.set_duration(self.duration_ms)
         self.trim_range_slider.setEnabled(self.duration_ms > 0)
         self.trim_start_spin.setEnabled(self.duration_ms > 0)
         self.trim_end_spin.setEnabled(self.duration_ms > 0)
@@ -2421,6 +2661,7 @@ class VideoEditorWindow(QMainWindow):
         self.picture_position_slider.setRange(0, duration)
         self.duration_ms = duration
         self.trim_range_slider.set_duration(duration)
+        self.preview_window.set_duration(duration)
 
     def update_trim_label(self, start_ms: int, end_ms: int) -> None:
         selected_ms = max(0, end_ms - start_ms)
@@ -2568,6 +2809,9 @@ class VideoEditorWindow(QMainWindow):
             self.position_slider.setValue(position)
         if not self.picture_position_slider.isSliderDown():
             self.picture_position_slider.setValue(position)
+        self.preview_window.set_position(
+            position, getattr(self, "duration_ms", 0)
+        )
         self.time_label.setText(
             f"{self.format_time(position)} / {self.format_time(getattr(self, 'duration_ms', 0))}"
         )
@@ -2756,6 +3000,7 @@ class VideoEditorWindow(QMainWindow):
         )
         self.picture_play_button.setToolTip(f"{action} video")
         self.picture_play_button.setAccessibleName(f"{action} video")
+        self.preview_window.set_playing(is_playing)
 
     def ffmpeg_filters(self) -> str | None:
         values = {key: slider.value() for key, slider in self.adjustment_sliders.items()}
