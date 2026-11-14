@@ -62,6 +62,7 @@ The build script downloads the FFmpeg bundle it needs and checks its SHA-256 che
 - Select video, audio, and subtitle streams and configure export options.
 - Save, load, and update presets spanning the editing tabs.
 - Remux compatible streams or re-encode with available FFmpeg encoders.
+- Experimental **Copy** tab: batch-remux files between containers, show incompatible tracks that will be skipped, and preserve source files without overwriting existing outputs.
 - Export MP4/MOV with web-optimized faststart when supported.
 
 

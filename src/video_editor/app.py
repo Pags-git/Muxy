@@ -30,6 +30,7 @@ from PySide6.QtGui import QAction, QColor, QIcon, QImage, QKeySequence, QPainter
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -37,9 +38,11 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QGroupBox,
+    QHeaderView,
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -54,6 +57,8 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QSplitter,
     QTabWidget,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -780,6 +785,156 @@ class ExportWorker(QObject):
             return f"{hours:d}:{minutes:02d}:{seconds:02d}"
         return f"{minutes:d}:{seconds:02d}"
 
+
+class CopyBatchWorker(QObject):
+    """Remux a list of files sequentially without re-encoding their streams."""
+
+    progress = Signal(int)
+    status = Signal(str)
+    finished = Signal(str)
+    failed = Signal(str)
+    cancelled = Signal(str)
+
+    def __init__(self, jobs: list[tuple[list[str], str, int]], outputs: list[str]) -> None:
+        super().__init__()
+        self.jobs = jobs
+        self.outputs = outputs
+        self.process: subprocess.Popen | None = None
+        self.active_output: str | None = None
+        self.active_output_created = False
+        self.cancel_requested = False
+
+    def stop(self) -> None:
+        self.cancel_requested = True
+        if self.process and self.process.poll() is None:
+            try:
+                self.process.terminate()
+            except ProcessLookupError:
+                pass
+
+    def run(self) -> None:
+        total = len(self.jobs)
+        for index, (command, source, duration_ms) in enumerate(self.jobs):
+            self.active_output = self.outputs[index]
+            self.active_output_created = False
+            if self.cancel_requested:
+                self._remove_partial()
+                self.cancelled.emit(self.outputs[index])
+                return
+            self.status.emit(f"Copying {index + 1} of {total}: {Path(source).name}")
+            try:
+                self.process = subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+                self.active_output_created = Path(self.active_output).is_file()
+                tail: list[str] = []
+                assert self.process.stdout is not None
+                for raw_line in self.process.stdout:
+                    line = raw_line.strip()
+                    if line:
+                        tail.append(line)
+                        tail = tail[-30:]
+                    if line.startswith("progress=") and line.endswith("end"):
+                        self.progress.emit(int((index + 1) * 100 / total))
+                    elif line.startswith("out_time="):
+                        try:
+                            hours, minutes, seconds = line.split("=", 1)[1].split(":")
+                            elapsed_ms = (
+                                (int(hours) * 3600 + int(minutes) * 60 + float(seconds))
+                                * 1000
+                            )
+                            fraction = min(0.99, elapsed_ms / max(duration_ms, 1))
+                            self.progress.emit(int((index + fraction) * 100 / total))
+                        except ValueError:
+                            pass
+                code = self.process.wait()
+                if self.cancel_requested:
+                    self._remove_partial()
+                    self.cancelled.emit(self.outputs[index])
+                    return
+                if code:
+                    self._remove_partial()
+                    self.failed.emit(
+                        f"Could not copy {Path(source).name}:\n\n"
+                        + ("\n".join(tail) or f"FFmpeg exited with code {code}.")
+                    )
+                    return
+            except OSError as exc:
+                self.failed.emit(str(exc))
+                return
+        self.progress.emit(100)
+        self.finished.emit("\n".join(self.outputs))
+
+    def _remove_partial(self) -> None:
+        try:
+            if self.active_output and self.active_output_created:
+                Path(self.active_output).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+class CopyFileDropList(QTreeWidget):
+    """File list that accepts video files dragged from the desktop or file manager."""
+
+    filesDropped = Signal(list)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setAcceptDrops(True)
+        self.drop_hint = QLabel("Drop video files here,\nor click Add files", self.viewport())
+        self.drop_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.drop_hint.setWordWrap(True)
+        self.drop_hint.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.drop_hint.setStyleSheet("color: #ffffff;")
+        self.update_drop_hint()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().resizeEvent(event)
+        self.drop_hint.setGeometry(self.viewport().rect())
+
+    def addTopLevelItem(self, item) -> None:  # noqa: N802 - Qt override
+        super().addTopLevelItem(item)
+        self.update_drop_hint()
+
+    def clear(self) -> None:
+        super().clear()
+        self.update_drop_hint()
+
+    def update_drop_hint(self) -> None:
+        if hasattr(self, "drop_hint"):
+            self.drop_hint.setVisible(self.topLevelItemCount() == 0)
+
+    @staticmethod
+    def local_paths(event) -> list[str]:
+        mime = event.mimeData()
+        if not mime or not mime.hasUrls():
+            return []
+        return [url.toLocalFile() for url in mime.urls() if url.isLocalFile()]
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if self.local_paths(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if self.local_paths(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event) -> None:  # noqa: N802 - Qt override
+        paths = self.local_paths(event)
+        if paths:
+            self.filesDropped.emit(paths)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
 class VideoEditorWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -799,12 +954,17 @@ class VideoEditorWindow(QMainWindow):
         self.setAcceptDrops(True)
         self.current_path: str | None = None
         self.media_info: dict = {}
+        self.duration_ms = 0
         self.settings_at_load: dict | None = None
         self.encoding_active = False
         self.audio_checks: list[tuple[int, QCheckBox]] = []
         self.subtitle_checks: list[tuple[int, QCheckBox]] = []
         self.export_thread: QThread | None = None
         self.export_worker: ExportWorker | None = None
+        self.copy_thread: QThread | None = None
+        self.copy_worker: CopyBatchWorker | None = None
+        self.copy_active = False
+        self.copy_items: list[tuple[str, dict]] = []
         self.app = QApplication.instance()
         config_path = QStandardPaths.writableLocation(
             QStandardPaths.StandardLocation.AppConfigLocation
@@ -1038,7 +1198,9 @@ class VideoEditorWindow(QMainWindow):
         about_action.triggered.connect(self.show_about)
         self.menuBar().addAction(about_action)
 
-        self.statusBar().showMessage("Drop a video file anywhere in the window to open it")
+        self.statusBar().showMessage(
+            "Drop a video file anywhere to open it, or drop files into the Copy tab to add them"
+        )
         if self.app:
             self.app.styleHints().colorSchemeChanged.connect(self.apply_theme)
         self.apply_theme()
@@ -1859,6 +2021,79 @@ class VideoEditorWindow(QMainWindow):
         self.subtitle_tracks_scroll.setWidget(subtitle_tracks_group)
         subtitles_tab_layout.addWidget(self.subtitle_tracks_scroll, 1)
 
+        copy_tab = QWidget()
+        copy_tab.setAcceptDrops(True)
+        copy_layout = QVBoxLayout(copy_tab)
+        copy_controls = QWidget()
+        copy_controls.setAcceptDrops(True)
+        copy_controls_layout = QVBoxLayout(copy_controls)
+        copy_controls_layout.setContentsMargins(0, 0, 0, 0)
+        copy_actions = QHBoxLayout()
+        self.copy_add_button = QPushButton("Add files")
+        self.copy_add_button.clicked.connect(self.add_copy_files)
+        self.copy_remove_button = QPushButton("Remove selected")
+        self.copy_remove_button.clicked.connect(self.remove_copy_files)
+        self.copy_clear_button = QPushButton("Clear list")
+        self.copy_clear_button.clicked.connect(self.clear_copy_files)
+        copy_actions.addWidget(self.copy_add_button)
+        copy_actions.addWidget(self.copy_remove_button)
+        copy_actions.addWidget(self.copy_clear_button)
+        copy_actions.addStretch(1)
+        copy_controls_layout.addLayout(copy_actions)
+        self.copy_file_list = CopyFileDropList()
+        self.copy_file_list.setHeaderLabels(["File", "Status"])
+        self.copy_file_list.setRootIsDecorated(False)
+        self.copy_file_list.setItemsExpandable(False)
+        self.copy_file_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        self.copy_file_list.setAlternatingRowColors(True)
+        self.copy_file_list.header().setStretchLastSection(False)
+        self.copy_file_list.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.copy_file_list.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self.copy_file_list.setColumnWidth(1, 125)
+        self.copy_file_list.setAcceptDrops(True)
+        self.copy_file_list.setMinimumHeight(180)
+        self.copy_file_list.setToolTip(
+            "Drop local video files here. The status column shows whether tracks are ready or will be skipped."
+        )
+        self.copy_file_list.filesDropped.connect(self.add_copy_paths)
+        copy_controls_layout.addWidget(self.copy_file_list, 1)
+        copy_settings = QGridLayout()
+        self.copy_container_combo = QComboBox()
+        self.copy_container_combo.addItems(
+            ["mp4", "mkv", "mov", "webm", "avi", "mpeg", "ts", "flv", "ogv"]
+        )
+        self.copy_container_combo.currentTextChanged.connect(self.refresh_copy_compatibility)
+        self.copy_output_folder = QLineEdit()
+        self.copy_output_folder.setReadOnly(True)
+        self.copy_output_folder.setPlaceholderText("Choose an output folder")
+        self.copy_browse_folder_button = QPushButton("Browse…")
+        self.copy_browse_folder_button.clicked.connect(self.choose_copy_output_folder)
+        copy_settings.addWidget(QLabel("Output container"), 0, 0)
+        copy_settings.addWidget(self.copy_container_combo, 0, 1)
+        copy_settings.addWidget(QLabel("Output folder"), 1, 0)
+        copy_settings.addWidget(self.copy_output_folder, 1, 1)
+        copy_settings.addWidget(self.copy_browse_folder_button, 1, 2)
+        copy_controls_layout.addLayout(copy_settings)
+        copy_layout.addWidget(copy_controls, 1)
+        self.copy_status_label = QLabel("Add one or more video files to begin.")
+        self.copy_status_label.setWordWrap(True)
+        copy_layout.addWidget(self.copy_status_label)
+        self.copy_progress = QProgressBar()
+        self.copy_progress.setRange(0, 100)
+        copy_layout.addWidget(self.copy_progress)
+        self.copy_button = QPushButton("Copy files")
+        self.copy_button.clicked.connect(self.toggle_copy)
+        copy_layout.addWidget(self.copy_button)
+        self.copy_controls = copy_controls
+        self.copy_tab = copy_tab
+        # Qt only sends drag-and-drop events to widgets that opt in. The
+        # application event filter routes any drop over this tab to its input
+        # list, including when the pointer is over a child control.
+        for drop_target in [copy_tab, *copy_tab.findChildren(QWidget)]:
+            drop_target.setAcceptDrops(True)
+
         export_tab = QWidget()
         export_layout = QVBoxLayout(export_tab)
         self.output_path: str | None = None
@@ -1962,6 +2197,7 @@ class VideoEditorWindow(QMainWindow):
         self.export_tabs.addTab(subtitles_tab, "Subtitles")
         self.export_tab_index = self.export_tabs.addTab(export_tab, "Export")
         self.export_tabs.addTab(presets_tab, "Presets")
+        self.copy_tab_index = self.export_tabs.addTab(copy_tab, "Copy")
         layout.addWidget(self.export_tabs)
 
         return panel
@@ -2111,7 +2347,307 @@ class VideoEditorWindow(QMainWindow):
             return True
         if kind == "audio" and codec.startswith("pcm_"):
             return container in {"mkv", "mov", "avi", "ts"}
+        # Subtitle conversion (for example SubRip/ASS to MP4 mov_text) requires
+        # encoding, so the copy-only tab accepts only already-compatible codecs.
+        if kind == "subtitle" and container in {"mp4", "mov"}:
+            return codec == "mov_text"
         return codec in supported
+
+    def add_copy_files(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Add files to copy", str(Path.home()), "Video files (*.*)"
+        )
+        if not paths:
+            return
+        self.add_copy_paths(paths)
+
+    def add_copy_paths(self, paths: list[str]) -> None:
+        already_added = {str(Path(path).resolve()) for path, _info in self.copy_items}
+        first_new_parent: Path | None = None
+        for path in paths:
+            resolved = str(Path(path).resolve())
+            if resolved in already_added:
+                continue
+            try:
+                info = probe_media(path)
+            except (OSError, subprocess.CalledProcessError, json.JSONDecodeError) as exc:
+                QMessageBox.warning(
+                    self, "Could not inspect file", f"{Path(path).name}:\n{exc}"
+                )
+                continue
+            if not any(s.get("codec_type") == "video" for s in info.get("streams", [])):
+                QMessageBox.warning(
+                    self, "No video stream", f"{Path(path).name} does not contain a video stream."
+                )
+                continue
+            self.copy_items.append((path, info))
+            already_added.add(resolved)
+            first_new_parent = first_new_parent or Path(path).parent
+        if not self.copy_output_folder.text().strip() and first_new_parent:
+            self.copy_output_folder.setText(str(first_new_parent))
+        self.refresh_copy_compatibility()
+
+    def remove_copy_files(self) -> None:
+        rows = sorted(
+            {
+                self.copy_file_list.indexOfTopLevelItem(item)
+                for item in self.copy_file_list.selectedItems()
+            },
+            reverse=True,
+        )
+        for row in rows:
+            if 0 <= row < len(self.copy_items):
+                self.copy_items.pop(row)
+        self.refresh_copy_compatibility()
+
+    def clear_copy_files(self) -> None:
+        self.copy_items.clear()
+        self.refresh_copy_compatibility()
+
+    def choose_copy_output_folder(self) -> None:
+        start = self.copy_output_folder.text().strip() or str(Path.home())
+        folder = QFileDialog.getExistingDirectory(self, "Choose output folder", start)
+        if folder:
+            self.copy_output_folder.setText(folder)
+
+    def copy_compatible_streams(self, info: dict, container: str) -> tuple[list[dict], list[str]]:
+        compatible: list[dict] = []
+        skipped: list[str] = []
+        for stream in info.get("streams", []):
+            kind = stream.get("codec_type")
+            if kind not in {"video", "audio", "subtitle"}:
+                if kind:
+                    skipped.append(f"{kind}: {stream.get('codec_name', 'unknown')}")
+                continue
+            codec = stream.get("codec_name", "unknown")
+            if self.codec_supported_by_container(container, kind, codec):
+                compatible.append(stream)
+            else:
+                skipped.append(f"{kind}: {codec}")
+        return compatible, skipped
+
+    def refresh_copy_compatibility(self, *_args) -> None:
+        if not hasattr(self, "copy_file_list"):
+            return
+        self.copy_file_list.clear()
+        container = self.copy_container_combo.currentText().lower()
+        no_video = 0
+        any_skipped = False
+        for path, info in self.copy_items:
+            compatible, skipped = self.copy_compatible_streams(info, container)
+            copied_video = any(s.get("codec_type") == "video" for s in compatible)
+            if not copied_video:
+                no_video += 1
+            if not copied_video:
+                status = "Unavailable"
+                details = "No video stream is compatible with the selected container."
+                if skipped:
+                    details += f"\nWould skip: {', '.join(skipped)}"
+            elif skipped:
+                status = f"Skips {len(skipped)} track(s)"
+                details = f"Will skip: {', '.join(skipped)}"
+            else:
+                status = "Ready"
+                details = "All video, audio and subtitle streams can be copied."
+            item = QTreeWidgetItem([Path(path).name, status])
+            item.setToolTip(0, f"{Path(path).name}\n{path}")
+            item.setToolTip(1, details)
+            self.copy_file_list.addTopLevelItem(item)
+            any_skipped = any_skipped or bool(skipped)
+        if not self.copy_items:
+            message = "Add one or more video files to begin."
+        elif no_video:
+            message = f"{no_video} file(s) have no video stream compatible with {container.upper()}."
+        elif any_skipped:
+            message = "Some tracks will be skipped. Hover over a file to see which ones."
+        else:
+            message = f"All listed streams can be copied into {container.upper()}."
+        self.copy_status_label.setText(message)
+        self.copy_button.setEnabled(bool(self.copy_items) and not no_video and not self.copy_active)
+
+    def toggle_copy(self) -> None:
+        if self.copy_active:
+            if not self.copy_worker:
+                return
+            confirmation = QMessageBox(self)
+            confirmation.setIcon(QMessageBox.Icon.Question)
+            confirmation.setWindowTitle("Stop copying?")
+            confirmation.setText("Stop the current file and delete its incomplete output?")
+            stop_button = confirmation.addButton(
+                "Stop and delete partial file", QMessageBox.ButtonRole.DestructiveRole
+            )
+            continue_button = confirmation.addButton(
+                "Continue copying", QMessageBox.ButtonRole.RejectRole
+            )
+            confirmation.setDefaultButton(continue_button)
+            self.prepare_confirmation_dialog(confirmation)
+            confirmation.exec()
+            if confirmation.clickedButton() is stop_button:
+                self.copy_button.setEnabled(False)
+                self.copy_button.setText("Stopping…")
+                self.copy_status_label.setText("Stopping and removing the partial output…")
+                self.copy_worker.stop()
+            return
+        self.start_copy()
+
+    def start_copy(self) -> None:
+        if not self.copy_items:
+            return
+        folder_text = self.copy_output_folder.text().strip()
+        if not folder_text:
+            self.choose_copy_output_folder()
+            folder_text = self.copy_output_folder.text().strip()
+            if not folder_text:
+                return
+        output_folder = Path(folder_text)
+        container = self.copy_container_combo.currentText().lower()
+        ffmpeg = media_tool("ffmpeg")
+        if not ffmpeg:
+            QMessageBox.critical(self, "FFmpeg is required", "The FFmpeg executable could not be found.")
+            return
+        planned: list[tuple[str, list[dict], Path, int]] = []
+        input_paths = {Path(path).resolve() for path, _info in self.copy_items}
+        planned_output_paths: set[Path] = set()
+        existing_outputs: list[Path] = []
+        for path, info in self.copy_items:
+            streams, skipped = self.copy_compatible_streams(info, container)
+            if not any(stream.get("codec_type") == "video" for stream in streams):
+                QMessageBox.warning(
+                    self, "No compatible video", f"{Path(path).name} has no video stream that can be copied to {container.upper()}."
+                )
+                return
+            output = output_folder / f"{Path(path).stem}_copy.{container}"
+            resolved_output = output.resolve()
+            if resolved_output in planned_output_paths:
+                QMessageBox.warning(
+                    self,
+                    "Duplicate output names",
+                    f"More than one input would write to this output file:\n{output}\n\n"
+                    "Choose a different output folder or remove one of the duplicate-named inputs.",
+                )
+                return
+            planned_output_paths.add(resolved_output)
+            if resolved_output in input_paths:
+                QMessageBox.warning(
+                    self,
+                    "Output matches an input file",
+                    f"The output name would replace a file in the copy list:\n{output}\n\n"
+                    "Choose a different output folder to protect the source files.",
+                )
+                return
+            if output.exists():
+                if not output.is_file():
+                    QMessageBox.warning(
+                        self,
+                        "Output path is not a file",
+                        f"The output path already exists and is not a regular file:\n{output}",
+                    )
+                    return
+                existing_outputs.append(output)
+            duration_ms = int(float(info.get("format", {}).get("duration", 0) or 0) * 1000)
+            planned.append((path, streams, output, duration_ms))
+
+        overwrite_paths: set[Path] = set()
+        if existing_outputs:
+            shown_paths = [str(path) for path in existing_outputs[:8]]
+            if len(existing_outputs) > 8:
+                shown_paths.append(f"…and {len(existing_outputs) - 8} more file(s)")
+            confirmation = QMessageBox(self)
+            confirmation.setIcon(QMessageBox.Icon.Warning)
+            confirmation.setWindowTitle("Overwrite existing files?")
+            confirmation.setText("This will overwrite the following file(s). Are you sure?")
+            confirmation.setInformativeText("\n".join(shown_paths))
+            yes_button = confirmation.addButton(
+                "Yes, overwrite", QMessageBox.ButtonRole.AcceptRole
+            )
+            no_button = confirmation.addButton(
+                "No", QMessageBox.ButtonRole.RejectRole
+            )
+            confirmation.setDefaultButton(no_button)
+            self.prepare_confirmation_dialog(confirmation)
+            confirmation.exec()
+            if confirmation.clickedButton() is not yes_button:
+                return
+            overwrite_paths = {path.resolve() for path in existing_outputs}
+
+        jobs: list[tuple[list[str], str, int]] = []
+        outputs: list[str] = []
+        for path, streams, output, duration_ms in planned:
+            overwrite_option = "-y" if output.resolve() in overwrite_paths else "-n"
+            command = [ffmpeg, "-hide_banner", overwrite_option, "-i", path]
+            for stream in streams:
+                command += ["-map", f"0:{stream['index']}"]
+            command += ["-map_metadata", "0", "-map_chapters", "0", "-c", "copy"]
+            if container in {"mp4", "mov"}:
+                command += ["-movflags", "+faststart"]
+            command += ["-progress", "pipe:1", "-nostats", str(output)]
+            jobs.append((command, path, duration_ms))
+            outputs.append(str(output))
+        try:
+            output_folder.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.critical(self, "Could not create output folder", str(exc))
+            return
+        self.copy_progress.setValue(0)
+        self.copy_active = True
+        self.set_encode_lock(True)
+        self.copy_button.setText("Stop copy")
+        self.copy_button.setEnabled(True)
+        self.copy_worker = CopyBatchWorker(jobs, outputs)
+        self.copy_thread = QThread(self)
+        self.copy_worker.moveToThread(self.copy_thread)
+        self.copy_thread.started.connect(self.copy_worker.run)
+        self.copy_worker.progress.connect(self.copy_progress.setValue)
+        self.copy_worker.status.connect(self.copy_status_label.setText)
+        self.copy_worker.finished.connect(self.copy_succeeded)
+        self.copy_worker.failed.connect(self.copy_failed)
+        self.copy_worker.cancelled.connect(self.copy_cancelled)
+        for signal in (self.copy_worker.finished, self.copy_worker.failed, self.copy_worker.cancelled):
+            signal.connect(self.copy_thread.quit)
+        self.copy_thread.finished.connect(self.copy_thread.deleteLater)
+        self.copy_thread.start()
+
+    def finish_copy(self) -> None:
+        self.copy_active = False
+        self.set_encode_lock(False)
+        self.copy_worker = None
+
+    def copy_succeeded(self, paths: str) -> None:
+        self.finish_copy()
+        self.copy_progress.setValue(100)
+        copied_count = len(paths.splitlines())
+        self.copy_status_label.setText(
+            f"Copied {copied_count} file(s) successfully. Outputs are in {self.copy_output_folder.text()}."
+        )
+        self.copy_button.setText("Copy files")
+        self.statusBar().showMessage("Copy operation complete", 10000)
+        confirmation = QMessageBox(self)
+        confirmation.setIcon(QMessageBox.Icon.Information)
+        confirmation.setWindowTitle("Copy complete")
+        confirmation.setText(
+            f"Copy finished successfully for {copied_count} file(s)."
+        )
+        confirmation.setInformativeText(
+            f"The copied files are in:\n{self.copy_output_folder.text()}"
+        )
+        ok_button = confirmation.addButton("OK", QMessageBox.ButtonRole.AcceptRole)
+        confirmation.setDefaultButton(ok_button)
+        self.prepare_confirmation_dialog(confirmation)
+        confirmation.exec()
+
+    def copy_failed(self, message: str) -> None:
+        self.finish_copy()
+        self.copy_button.setText("Copy files")
+        self.copy_status_label.setText("Copy failed. See the error details.")
+        self.statusBar().showMessage("Copy operation failed")
+        QMessageBox.critical(self, "Copy failed", message)
+
+    def copy_cancelled(self, _path: str) -> None:
+        self.finish_copy()
+        self.copy_button.setText("Copy files")
+        self.copy_progress.setValue(0)
+        self.copy_status_label.setText("Copy stopped. The incomplete output was deleted.")
+        self.statusBar().showMessage("Copy stopped and partial output removed", 10000)
 
     def update_container_options(self) -> None:
         """Disable containers that cannot accept the selected output streams."""
@@ -2301,7 +2837,13 @@ class VideoEditorWindow(QMainWindow):
                 paths = [url.toLocalFile() for url in mime.urls() if url.isLocalFile()]
                 if paths:
                     if event.type() == QEvent.Type.Drop:
-                        self.load_video(paths[0])
+                        # The selected tool determines the destination for
+                        # every drop. While Copy is active, even a drop over
+                        # the preview belongs to the Copy input list.
+                        if self.export_tabs.currentWidget() is self.copy_tab:
+                            self.add_copy_paths(paths)
+                        else:
+                            self.load_video(paths[0])
                     event.acceptProposedAction()
                     return True
         return super().eventFilter(watched, event)
@@ -3197,10 +3739,17 @@ class VideoEditorWindow(QMainWindow):
         self.seek_back_button.setEnabled(not locked)
         self.play_button.setEnabled(not locked)
         self.seek_forward_button.setEnabled(not locked)
+        active_tab_index = self.copy_tab_index if self.copy_active else self.export_tab_index
         for index in range(self.export_tabs.count()):
-            self.export_tabs.setTabEnabled(index, not locked or index == self.export_tab_index)
-        self.export_button.setEnabled(True)
+            self.export_tabs.setTabEnabled(index, not locked or index == active_tab_index)
+        self.export_button.setEnabled(not self.copy_active)
         self.export_button.setText("Stop encode" if locked else "Encode video")
+        if hasattr(self, "copy_controls"):
+            self.copy_controls.setEnabled(not locked)
+            self.copy_button.setText("Stop copy" if locked and self.copy_active else "Copy files")
+            self.copy_button.setEnabled(
+                (locked and self.copy_active) or (not locked and bool(self.copy_items))
+            )
         web_faststart_supported = self.format_combo.currentText().strip().lstrip(".").lower() in {"mp4", "mov"}
         self.web_optimize_check.setEnabled(not locked and web_faststart_supported)
         self.setAcceptDrops(not locked)
