@@ -64,7 +64,7 @@ from PySide6.QtWidgets import (
 )
 
 # Current product version shown in About and application metadata.
-APP_VERSION = "10.6.0.13"
+APP_VERSION = "10.6.0.14"
 
 
 def probe_media(path: str) -> dict:
