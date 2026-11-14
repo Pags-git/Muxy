@@ -64,7 +64,7 @@ from PySide6.QtWidgets import (
 )
 
 # Current product version shown in About and application metadata.
-APP_VERSION = "10.6.0.14"
+APP_VERSION = "10.6.0.18"
 
 
 def probe_media(path: str) -> dict:
@@ -1198,9 +1198,6 @@ class VideoEditorWindow(QMainWindow):
         about_action.triggered.connect(self.show_about)
         self.menuBar().addAction(about_action)
 
-        self.statusBar().showMessage(
-            "Drop a video file anywhere to open it, or drop files into the Copy tab to add them"
-        )
         if self.app:
             self.app.styleHints().colorSchemeChanged.connect(self.apply_theme)
         self.apply_theme()
@@ -1293,6 +1290,8 @@ class VideoEditorWindow(QMainWindow):
 
         stylesheet = (
             f"QMainWindow {{ background: {window}; }} QWidget {{ color: {foreground}; }}"
+            f"QStatusBar {{ background-color: {window}; color: {foreground}; }}"
+            "QStatusBar::item { border: none; }"
             f"QGroupBox {{ border: 1px solid {border}; border-radius: 5px; margin-top: 10px;"
             " padding: 8px; font-weight: 600; }"
             "QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }"
@@ -1455,6 +1454,7 @@ class VideoEditorWindow(QMainWindow):
                 "container": self.format_combo.currentText(),
                 "codec": self.video_codec_combo.currentData(),
                 "quality": self.rf_slider.value(),
+                "speed": self.encode_speed_combo.currentData(),
                 "frame_rate": self.frame_rate_combo.currentData(),
                 "color_range": self.color_range_combo.currentData(),
             },
@@ -1607,6 +1607,9 @@ class VideoEditorWindow(QMainWindow):
             warnings.append("The saved video encoder is unavailable; the current encoder was kept.")
         self.update_video_controls_enabled()
         self.rf_slider.setValue(int(video.get("quality", self.rf_slider.value())))
+        speed_index = self.encode_speed_combo.findData(video.get("speed"))
+        if speed_index >= 0:
+            self.encode_speed_combo.setCurrentIndex(speed_index)
         frame_rate_index = self.frame_rate_combo.findData(video.get("frame_rate"))
         if frame_rate_index >= 0:
             self.frame_rate_combo.setCurrentIndex(frame_rate_index)
@@ -1922,6 +1925,15 @@ class VideoEditorWindow(QMainWindow):
         self.rf_slider.valueChanged.connect(
             lambda value: self.rf_value_label.setText(str(value))
         )
+        self.encode_speed_combo = QComboBox()
+        self.encode_speed_combo.addItem("Fast", "fast")
+        self.encode_speed_combo.addItem("Very fast", "veryfast")
+        self.encode_speed_combo.addItem("Balanced", "balanced")
+        self.encode_speed_combo.addItem("Higher quality", "quality")
+        self.encode_speed_combo.setToolTip(
+            "Fast uses a speed-focused encoder preset and can make larger files. "
+            "Balanced and Higher quality trade encoding speed for compression efficiency."
+        )
 
         self.frame_rate_combo = QComboBox()
         for label, value in (
@@ -1952,13 +1964,15 @@ class VideoEditorWindow(QMainWindow):
         video_tab_layout.addWidget(QLabel("RF / quality"), 2, 0)
         video_tab_layout.addWidget(self.rf_slider, 2, 1)
         video_tab_layout.addWidget(self.rf_value_label, 2, 2)
-        video_tab_layout.addWidget(QLabel("Frame rate"), 3, 0)
-        video_tab_layout.addWidget(self.frame_rate_combo, 3, 1, 1, 2)
-        video_tab_layout.addWidget(QLabel("Color range"), 4, 0)
-        video_tab_layout.addWidget(self.color_range_combo, 4, 1, 1, 2)
+        video_tab_layout.addWidget(QLabel("Encoding speed"), 3, 0)
+        video_tab_layout.addWidget(self.encode_speed_combo, 3, 1, 1, 2)
+        video_tab_layout.addWidget(QLabel("Frame rate"), 4, 0)
+        video_tab_layout.addWidget(self.frame_rate_combo, 4, 1, 1, 2)
+        video_tab_layout.addWidget(QLabel("Color range"), 5, 0)
+        video_tab_layout.addWidget(self.color_range_combo, 5, 1, 1, 2)
         video_tab_layout.setColumnMinimumWidth(2, 38)
         video_tab_layout.setColumnStretch(1, 1)
-        video_tab_layout.setRowStretch(5, 1)
+        video_tab_layout.setRowStretch(6, 1)
 
         audio_tab = QWidget()
         audio_tab_layout = QVBoxLayout(audio_tab)
@@ -2144,6 +2158,7 @@ class VideoEditorWindow(QMainWindow):
         self.format_combo.currentTextChanged.connect(self.update_export_video_summary)
         self.video_codec_combo.currentIndexChanged.connect(self.update_export_video_summary)
         self.rf_slider.valueChanged.connect(self.update_export_video_summary)
+        self.encode_speed_combo.currentIndexChanged.connect(self.update_export_video_summary)
         self.frame_rate_combo.currentIndexChanged.connect(self.update_export_video_summary)
         self.color_range_combo.currentIndexChanged.connect(self.update_export_video_summary)
         self.audio_codec_combo.currentIndexChanged.connect(self.update_export_audio_summary)
@@ -2273,6 +2288,7 @@ class VideoEditorWindow(QMainWindow):
         elif video_codec in {"libx264", "libx265", "libvpx-vp9"}:
             self.rf_slider.setValue(22)
         self.rf_slider.setEnabled(video_codec != "copy")
+        self.encode_speed_combo.setEnabled(video_codec != "copy")
         encoding_video = video_codec != "copy"
         self.frame_rate_combo.setEnabled(encoding_video)
         self.color_range_combo.setEnabled(encoding_video)
@@ -2729,10 +2745,17 @@ class VideoEditorWindow(QMainWindow):
 
     def update_export_video_summary(self, *_args) -> None:
         """Show the chosen video export settings in the Export tab."""
+        if self.video_codec_combo.currentData() == "copy":
+            quality_summary = "Not applicable (passthrough)"
+        else:
+            quality_summary = (
+                f"{self.rf_slider.value()} | Encoding speed: "
+                f"{self.encode_speed_combo.currentText()}"
+            )
         values = {
             "Container": self.format_combo.currentText(),
             "Video": self.video_codec_combo.currentText() or "Encoder unavailable",
-            "RF": str(self.rf_slider.value()),
+            "RF": quality_summary,
             "Frame rate": self.frame_rate_combo.currentText(),
             "Color": self.color_range_combo.currentText(),
         }
@@ -2932,7 +2955,7 @@ class VideoEditorWindow(QMainWindow):
             preview.set_placeholder(placeholder)
         self.player.setSource(QUrl.fromLocalFile(path))
         self.load_first_preview_frame(path)
-        self.statusBar().showMessage(f"Loaded {path}")
+        self.statusBar().clearMessage()
 
     def reset_settings_for_new_video(self) -> None:
         """Restore per-file editing and export options to their defaults."""
@@ -2947,6 +2970,9 @@ class VideoEditorWindow(QMainWindow):
         if video_codec_index >= 0:
             self.video_codec_combo.setCurrentIndex(video_codec_index)
         self.rf_slider.setValue(22)
+        fast_speed_index = self.encode_speed_combo.findData("fast")
+        if fast_speed_index >= 0:
+            self.encode_speed_combo.setCurrentIndex(fast_speed_index)
         frame_rate_index = self.frame_rate_combo.findData("30")
         if frame_rate_index >= 0:
             self.frame_rate_combo.setCurrentIndex(frame_rate_index)
@@ -3637,6 +3663,26 @@ class VideoEditorWindow(QMainWindow):
             if check.isChecked():
                 command += ["-map", f"0:{index}"]
         command += ["-c:v", video_codec]
+        speed_mode = self.encode_speed_combo.currentData()
+        if video_codec in {"h264_nvenc", "hevc_nvenc"}:
+            nvenc_preset = {
+                "veryfast": "p1", "fast": "p2", "balanced": "p4", "quality": "p6"
+            }[speed_mode]
+            command += ["-preset", nvenc_preset]
+        elif video_codec in {"libx264", "libx265"}:
+            software_preset = {
+                "veryfast": "ultrafast", "fast": "veryfast",
+                "balanced": "medium", "quality": "slow",
+            }[speed_mode]
+            command += ["-preset", software_preset]
+        elif video_codec == "libvpx-vp9":
+            vp9_settings = {
+                "veryfast": ["-deadline", "realtime", "-cpu-used", "8"],
+                "fast": ["-deadline", "realtime", "-cpu-used", "6"],
+                "balanced": ["-deadline", "good", "-cpu-used", "2"],
+                "quality": ["-deadline", "good", "-cpu-used", "0"],
+            }[speed_mode]
+            command += vp9_settings
         if filters:
             command += ["-vf", filters]
         if video_codec in ("libx264", "libx265"):
